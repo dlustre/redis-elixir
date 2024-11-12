@@ -3,20 +3,34 @@ defmodule Server do
   Your implementation of a Redis server
   """
 
+  @array ?*
+  @bulk_str ?$
+  @sep "\r\n"
+
   use Application
+
+  defmodule Array do
+    defstruct elems: []
+  end
 
   def start(_type, _args) do
     Supervisor.start_link([{Task, fn -> Server.listen() end}], strategy: :one_for_one)
   end
 
-  def handle("*1\r\n$4\r\nPING\r\n", socket), do: :gen_tcp.send(socket, "+PONG\r\n")
+  def command(<<"PING", _::binary>>, _, socket), do: :gen_tcp.send(socket, "+PONG\r\n")
 
-  def handle(_, _), do: raise("Huh")
+  def command(<<"ECHO", @sep, msg::binary>>, _, socket), do: :gen_tcp.send(socket, msg)
 
   def serve(socket) do
     case :gen_tcp.recv(socket, 0) do
-      {:ok, data} -> handle(data, socket)
-      _ -> raise "Todo"
+      {:ok,
+       <<@array, num_args::8-bitstring, @sep, @bulk_str, _command_length::8-bitstring, @sep,
+         command::binary>>} ->
+        command(command, String.to_integer(num_args) - 1, socket)
+
+      msg ->
+        IO.inspect(msg)
+        raise "Unknown"
     end
 
     serve(socket)
