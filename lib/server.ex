@@ -9,22 +9,23 @@ defmodule Server do
     Supervisor.start_link([{Task, fn -> Server.listen() end}], strategy: :one_for_one)
   end
 
-  def handle("*1\r\n$4\r\nPING\r\n", client), do: :gen_tcp.send(client, "+PONG\r\n")
+  def handle("*1\r\n$4\r\nPING\r\n", socket), do: :gen_tcp.send(socket, "+PONG\r\n")
 
   def handle(_, _), do: raise("Huh")
 
-  def serve(client) do
-    case :gen_tcp.recv(client, 0) do
-      {:ok, data} -> handle(data, client)
+  def serve(socket) do
+    case :gen_tcp.recv(socket, 0) do
+      {:ok, data} -> handle(data, socket)
       _ -> raise "Todo"
     end
 
-    serve(client)
+    serve(socket)
   end
 
   def loop_acceptor(socket) do
     {:ok, client} = :gen_tcp.accept(socket)
-    serve(client)
+    Task.start_link(fn -> serve(client) end)
+    loop_acceptor(socket)
   end
 
   @doc """
