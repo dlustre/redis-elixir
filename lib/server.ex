@@ -4,6 +4,7 @@ defmodule Server do
   """
 
   @array ?*
+  @simple_str ?+
   @bulk_str ?$
   @sep "\r\n"
   @digit ?0..?9
@@ -21,10 +22,11 @@ defmodule Server do
   def consume_digits(<<@sep, tl::binary>>, acc),
     do: {String.to_integer(acc) |> IO.inspect(label: "evaluated length num"), tl}
 
-  def consume_digits(<<n, tl::binary>>, acc) when n in @digit do
-    IO.puts("here")
-    consume_digits(tl, <<acc::binary, n>>)
-  end
+  def consume_digits(<<n, tl::binary>>, acc) when n in @digit,
+    do: consume_digits(tl, <<acc::binary, n>>)
+
+  def encode(@simple_str, str),
+    do: <<@simple_str>> <> str <> @sep
 
   def encode(@bulk_str, str),
     do: <<@bulk_str>> <> (str |> String.length() |> Integer.to_string()) <> @sep <> str <> @sep
@@ -50,9 +52,8 @@ defmodule Server do
         {arg, tl} = decode(bin)
         {[arg | args], tl}
       end)
-      |> IO.inspect()
 
-    %Command{kind: kind, args: args} |> IO.inspect()
+    %Command{kind: kind, args: Enum.reverse(args)} |> IO.inspect()
   end
 
   def exec(%Command{kind: "PING"}, socket), do: :gen_tcp.send(socket, "+PONG\r\n")
@@ -60,12 +61,24 @@ defmodule Server do
   def exec(%Command{kind: "ECHO", args: [msg]}, socket),
     do: :gen_tcp.send(socket, encode(@bulk_str, msg))
 
+  def exec(%Command{kind: "SET", args: [key, value]}, socket) do
+    true = :ets.insert(:redis, {key, value})
+    :gen_tcp.send(socket, encode(@simple_str, "OK"))
+  end
+
+  def exec(%Command{kind: "GET", args: [key]}, socket) do
+    :ets.tab2list(:redis) |> IO.inspect()
+    [{^key, value}] = :ets.lookup(:redis, key) |> IO.inspect()
+    :gen_tcp.send(socket, encode(@bulk_str, value))
+  end
+
   def serve(socket) do
     case :gen_tcp.recv(socket, 0) do
       {:ok, data} ->
         data |> command() |> exec(socket)
 
       {:error, :closed} ->
+        IO.puts("Socket closed")
         nil
 
       msg ->
@@ -89,6 +102,7 @@ defmodule Server do
     # Since the tester restarts your program quite often, setting SO_REUSEADDR
     # ensures that we don't run into 'Address already in use' errors
     {:ok, socket} = :gen_tcp.listen(6379, [:binary, active: false, reuseaddr: true])
+    :ets.new(:redis, [:set, :public, :named_table])
 
     loop_acceptor(socket)
   end
