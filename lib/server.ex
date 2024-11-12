@@ -8,6 +8,7 @@ defmodule Server do
   @bulk_str ?$
   @sep "\r\n"
   @digit ?0..?9
+  @null_bulk_str "$-1\r\n"
 
   use Application
 
@@ -61,15 +62,32 @@ defmodule Server do
   def exec(%Command{kind: "ECHO", args: [msg]}, socket),
     do: :gen_tcp.send(socket, encode(@bulk_str, msg))
 
+  def exec(%Command{kind: "SET", args: [key, value, "px", expiry_ms]}, socket) do
+    expiration = :os.system_time(:millisecond) + String.to_integer(expiry_ms)
+    true = :ets.insert(:redis, {key, value, expiration})
+    :gen_tcp.send(socket, encode(@simple_str, "OK"))
+  end
+
   def exec(%Command{kind: "SET", args: [key, value]}, socket) do
     true = :ets.insert(:redis, {key, value})
     :gen_tcp.send(socket, encode(@simple_str, "OK"))
   end
 
   def exec(%Command{kind: "GET", args: [key]}, socket) do
-    :ets.tab2list(:redis) |> IO.inspect()
-    [{^key, value}] = :ets.lookup(:redis, key) |> IO.inspect()
-    :gen_tcp.send(socket, encode(@bulk_str, value))
+    value =
+      case :ets.lookup(:redis, key) |> IO.inspect() do
+        [{^key, value, expiration}] ->
+          if expiration <= :os.system_time(:millisecond) do
+            @null_bulk_str
+          else
+            encode(@bulk_str, value)
+          end
+
+        [{^key, value}] ->
+          encode(@bulk_str, value)
+      end
+
+    :gen_tcp.send(socket, value)
   end
 
   def serve(socket) do
