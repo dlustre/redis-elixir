@@ -137,7 +137,7 @@ defmodule Rdb do
     {%Section{kind: :kv_pair, data: %{key: key, val: val, expiretime: expiretime}}, tl}
   end
 
-  def parse(<<@expiretime_ms, expiretime_ms::64-little, bin::binary>>) do
+  def parse(<<@expiretime_ms, expiretime_ms::64-little, @string, bin::binary>>) do
     IO.puts("expiretime_ms")
     {key, tl} = consume(bin, :str_encoded) |> IO.inspect()
     {val, tl} = consume(tl, :str_encoded) |> IO.inspect()
@@ -285,13 +285,30 @@ defmodule Server do
         |> Ctx.filepath()
         |> File.read!()
         |> Rdb.parse_file([])
-        |> IO.inspect(label: "sections")
         |> Enum.filter(fn %Rdb.Section{kind: kind} -> kind == :kv_pair end)
-        |> Enum.find_value(fn %Rdb.Section{data: %{key: candidate, val: val}} ->
-          if candidate == key, do: val
+        |> IO.inspect(label: "kv_pairs")
+        |> Enum.find_value(fn %Rdb.Section{data: %{key: candidate, val: val} = data} ->
+          if candidate != key do
+            nil
+          else
+            # TODO: maybe set expiretime as {time, time_unit()}
+            case data do
+              %{expiretime: e} ->
+                if e <= :os.system_time(:second),
+                  do: @null_bulk_str,
+                  else: encode(val, @bulk_str)
+
+              %{expiretime_ms: e} ->
+                if e <= :os.system_time(:millisecond),
+                  do: @null_bulk_str,
+                  else: encode(val, @bulk_str)
+
+              _ ->
+                encode(val, @bulk_str)
+            end
+          end
         end)
         |> IO.inspect(label: "value for: " <> key)
-        |> encode(@bulk_str)
       )
 
   def exec(%Command{kind: "CONFIG", args: ["GET", name]}, ctx),
