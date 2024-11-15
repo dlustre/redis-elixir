@@ -88,16 +88,16 @@ defmodule Rdb do
   def consume(bin, :str_encoded) do
     case consume(bin, :length_encoded) do
       {:eight, tl} ->
-        <<int_str, tl::binary>> = tl
-        {int_str, tl} |> IO.inspect(label: "str_encoded:eight")
+        <<int, tl::binary>> = tl
+        {int, tl} |> IO.inspect(label: "str_encoded:eight")
 
       {:sixteen, tl} ->
-        <<int_str::16-little, tl::binary>> = tl
-        {int_str, tl} |> IO.inspect(label: "str_encoded:sixteen")
+        <<int::16-little, tl::binary>> = tl
+        {int, tl} |> IO.inspect(label: "str_encoded:sixteen")
 
       {:thirtytwo, tl} ->
-        <<int_str::32-little, tl::binary>> = tl
-        {int_str, tl} |> IO.inspect(label: "str_encoded:thirtytwo")
+        <<int::32-little, tl::binary>> = tl
+        {int, tl} |> IO.inspect(label: "str_encoded:thirtytwo")
 
       {length, tl} ->
         <<str::size(length)-binary, tl::binary>> = tl
@@ -261,7 +261,8 @@ defmodule Server do
     :gen_tcp.send(ctx.client, encode("OK", @simple_str))
   end
 
-  def exec(%Command{kind: "GET", args: [key]}, ctx) do
+  def exec(%Command{kind: "GET", args: [key]}, %Ctx{config: config, client: client})
+      when config == %{} do
     value =
       case :ets.lookup(:redis, key) |> IO.inspect() do
         [{^key, value, expiration}] ->
@@ -273,8 +274,25 @@ defmodule Server do
           encode(value, @bulk_str)
       end
 
-    :gen_tcp.send(ctx.client, value)
+    :gen_tcp.send(client, value)
   end
+
+  def exec(%Command{kind: "GET", args: [key]}, ctx),
+    do:
+      :gen_tcp.send(
+        ctx.client,
+        ctx
+        |> Ctx.filepath()
+        |> File.read!()
+        |> Rdb.parse_file([])
+        |> IO.inspect(label: "sections")
+        |> Enum.filter(fn %Rdb.Section{kind: kind} -> kind == :kv_pair end)
+        |> Enum.find_value(fn %Rdb.Section{data: %{key: candidate, val: val}} ->
+          if candidate == key, do: val
+        end)
+        |> IO.inspect(label: "value for: " <> key)
+        |> encode(@bulk_str)
+      )
 
   def exec(%Command{kind: "CONFIG", args: ["GET", name]}, ctx),
     do:
