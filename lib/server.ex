@@ -170,11 +170,23 @@ defmodule Rdb do
   end
 end
 
+default_config = %{
+  port: 6379,
+  master_replid: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
+  master_repl_offset: 0
+}
+
+array = ?*
+simple_str = ?+
+bulk_str = ?$
+
 defmodule Server do
+  use Application
+
   # Encodings.
-  @array ?*
-  @simple_str ?+
-  @bulk_str ?$
+  @array array
+  @simple_str simple_str
+  @bulk_str bulk_str
 
   # Commands.
   @replconf "REPLCONF"
@@ -185,22 +197,10 @@ defmodule Server do
   @digit ?0..?9
   @null_bulk_str "$-1\r\n"
   @pong "+PONG\r\n"
-
-  use Application
-
-  @default_config %{
-    port: 6379,
-    master_replid: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
-    master_repl_offset: 0
-  }
+  @default_config default_config
 
   defmodule Ctx do
-    @default_config %{
-      port: 6379,
-      master_replid: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
-      master_repl_offset: 0
-    }
-    defstruct socket: nil, client: nil, config: @default_config
+    defstruct socket: nil, client: nil, config: default_config
 
     def config_get(%Ctx{config: config}, name) when is_atom(name), do: Map.fetch!(config, name)
 
@@ -217,8 +217,18 @@ defmodule Server do
   end
 
   defmodule Command do
+    @array array
+    @bulk_str bulk_str
+
     @enforce_keys [:kind, :args]
     defstruct [:kind, :args]
+
+    def encode(%Command{kind: kind, args: args}) do
+      [kind | args]
+      |> Enum.map(&Server.encode(&1, @bulk_str))
+      |> Server.encode(@array)
+      |> IO.inspect()
+    end
   end
 
   def start(_type, _args) do
@@ -398,10 +408,13 @@ defmodule Server do
       ) do
     IO.puts("psync: #{replid}, #{repl_offset}")
 
-    :ok =
-      :gen_tcp.send(client, encode("FULLRESYNC #{master_replid} 0", @simple_str) |> IO.inspect())
+    :ok = :gen_tcp.send(client, encode("FULLRESYNC #{master_replid} 0", @simple_str))
+    :ok = :gen_tcp.send(client, Rdb.empty_file() |> encode_file())
 
-    :gen_tcp.send(client, Rdb.empty_file() |> encode_file())
+    Agent.update(ReplicaSet, fn rs -> MapSet.put(rs, client) end)
+
+    Agent.get(ReplicaSet, & &1)
+    |> IO.inspect(label: "psync successful, adding client to replicaset")
   end
 
   def exec(unknown_cmd, ctx) do
@@ -413,7 +426,13 @@ defmodule Server do
   def serve(ctx) do
     case :gen_tcp.recv(ctx.client, 0) do
       {:ok, data} ->
-        data |> command() |> exec(ctx)
+        command = command(data)
+
+        Agent.get(ReplicaSet, & &1)
+        |> Enum.map(&:gen_tcp.send(&1, Command.encode(command)))
+        |> IO.inspect(label: "propagation result")
+
+        exec(command, ctx)
 
       {:error, :closed} ->
         IO.puts("Socket closed")
@@ -433,11 +452,7 @@ defmodule Server do
     loop_acceptor(ctx)
   end
 
-  def listen(%Ctx{config: %{port: port, replicaof: replicaof}} = ctx) do
-    {:ok, socket} =
-      :gen_tcp.listen(port, [:binary, active: false, reuseaddr: true])
-      |> IO.inspect(label: "Listening to port: #{port}")
-
+  def send_handshake(%Ctx{config: %{port: port, replicaof: replicaof}}) do
     [master_base, master_port] = String.split(replicaof)
 
     {:ok, master_socket} =
@@ -454,34 +469,37 @@ defmodule Server do
 
     ok_res = ok()
 
-    encode_command =
-      fn args ->
-        args
-        |> Enum.map(&encode(&1, @bulk_str))
-        |> encode(@array)
-        |> IO.inspect()
-      end
+    :gen_tcp.send(
+      master_socket,
+      Command.encode(%Command{kind: @replconf, args: ["listening-port", "#{port}"]})
+    )
 
-    :gen_tcp.send(master_socket, encode_command.([@replconf, "listening-port", "#{port}"]))
     {:ok, ^ok_res} = :gen_tcp.recv(master_socket, 0) |> IO.inspect(label: "listening-port res")
 
-    :gen_tcp.send(master_socket, encode_command.([@replconf, "capa", "eof", "capa", "psync2"]))
+    :gen_tcp.send(
+      master_socket,
+      Command.encode(%Command{kind: @replconf, args: ["capa", "eof", "capa", "psync2"]})
+    )
+
     {:ok, ^ok_res} = :gen_tcp.recv(master_socket, 0) |> IO.inspect(label: "recv ok for capa")
 
-    :gen_tcp.send(master_socket, encode_command.([@psync, "?", "-1"]))
+    :gen_tcp.send(master_socket, Command.encode(%Command{kind: @psync, args: ["?", "-1"]}))
 
     {:ok, _} =
       :gen_tcp.recv(master_socket, 0) |> IO.inspect(label: "psync and file res")
-
-    :ets.new(:redis, [:set, :public, :named_table])
-
-    loop_acceptor(%Ctx{ctx | socket: socket})
   end
 
   @doc """
   Listen for incoming connections
   """
-  def listen(ctx) do
+  def listen(%Ctx{config: %{replicaof: _}} = ctx) do
+    send_handshake(ctx)
+    do_listen(ctx)
+  end
+
+  def listen(ctx), do: do_listen(ctx)
+
+  def do_listen(ctx) do
     # Since the tester restarts your program quite often, setting SO_REUSEADDR
     # ensures that we don't run into 'Address already in use' errors
     {:ok, socket} =
@@ -489,7 +507,7 @@ defmodule Server do
       |> IO.inspect(label: "Listening to port: #{ctx.config.port}")
 
     :ets.new(:redis, [:set, :public, :named_table])
-
+    {:ok, _} = Agent.start_link(&MapSet.new/0, name: ReplicaSet)
     loop_acceptor(%Ctx{ctx | socket: socket})
   end
 end
