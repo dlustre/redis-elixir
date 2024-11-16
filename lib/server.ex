@@ -130,18 +130,18 @@ defmodule Rdb do
     {%Section{kind: :kv_pair, data: %{key: key, val: val}}, tl}
   end
 
-  def parse(<<@expiretime, expiretime::32-little, bin::binary>>) do
+  def parse(<<@expiretime, time::32-little, bin::binary>>) do
     IO.puts("expiretime")
     {key, tl} = consume(bin, :str_encoded) |> IO.inspect()
     {val, tl} = consume(tl, :str_encoded) |> IO.inspect()
-    {%Section{kind: :kv_pair, data: %{key: key, val: val, expiretime: expiretime}}, tl}
+    {%Section{kind: :kv_pair, data: %{key: key, val: val, expiretime: {time, :second}}}, tl}
   end
 
-  def parse(<<@expiretime_ms, expiretime_ms::64-little, @string, bin::binary>>) do
+  def parse(<<@expiretime_ms, time::64-little, @string, bin::binary>>) do
     IO.puts("expiretime_ms")
     {key, tl} = consume(bin, :str_encoded) |> IO.inspect()
     {val, tl} = consume(tl, :str_encoded) |> IO.inspect()
-    {%Section{kind: :kv_pair, data: %{key: key, val: val, expiretime_ms: expiretime_ms}}, tl}
+    {%Section{kind: :kv_pair, data: %{key: key, val: val, expiretime: {time, :millisecond}}}, tl}
   end
 
   def parse(<<@aux, bin::binary>>) do
@@ -204,6 +204,10 @@ defmodule Server do
   defmodule Command do
     @enforce_keys [:kind, :args]
     defstruct [:kind, :args]
+    # def encode(%Command{kind: kind, args: args}), do:
+    #   [kind | args]
+    #   |> IO.inspect()
+    #   |>
   end
 
   def start(_type, _args) do
@@ -301,15 +305,9 @@ defmodule Server do
           if candidate != key do
             nil
           else
-            # TODO: maybe set expiretime as {time, time_unit()}
             case data do
-              %{expiretime: e} ->
-                if e <= :os.system_time(:second),
-                  do: @null_bulk_str,
-                  else: encode(val, @bulk_str)
-
-              %{expiretime_ms: e} ->
-                if e <= :os.system_time(:millisecond),
+              %{expiretime: {e, time_unit}} ->
+                if e <= :os.system_time(time_unit),
                   do: @null_bulk_str,
                   else: encode(val, @bulk_str)
 
@@ -401,6 +399,24 @@ defmodule Server do
     {:ok, client} = :gen_tcp.accept(ctx.socket)
     Task.start_link(fn -> serve(%Ctx{ctx | client: client}) end)
     loop_acceptor(ctx)
+  end
+
+  def listen(%Ctx{config: %{port: port, replicaof: replicaof}} = ctx) do
+    {:ok, socket} =
+      :gen_tcp.listen(port, [:binary, active: false, reuseaddr: true])
+      |> IO.inspect(label: "Listening to port: #{port}")
+
+    [base, port] = String.split(replicaof)
+
+    {:ok, master_socket} =
+      :gen_tcp.connect(to_charlist(base), String.to_integer(port), [:binary, active: false])
+      |> IO.inspect(label: "connected to #{replicaof}")
+
+    :gen_tcp.send(master_socket, [encode("PING", @bulk_str)] |> encode(@array) |> IO.inspect())
+
+    :ets.new(:redis, [:set, :public, :named_table])
+
+    loop_acceptor(%Ctx{ctx | socket: socket})
   end
 
   @doc """
