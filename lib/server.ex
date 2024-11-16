@@ -175,10 +175,18 @@ defmodule Server do
 
   use Application
 
-  @default_config %{port: 6379}
+  @default_config %{
+    port: 6379,
+    master_replid: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
+    master_repl_offset: 0
+  }
 
   defmodule Ctx do
-    @default_config %{port: 6379}
+    @default_config %{
+      port: 6379,
+      master_replid: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
+      master_repl_offset: 0
+    }
     defstruct socket: nil, client: nil, config: @default_config
 
     def config_get(%Ctx{config: config}, name) when is_atom(name), do: Map.fetch!(config, name)
@@ -339,11 +347,32 @@ defmodule Server do
         |> encode(@array)
       )
 
-  def exec(%Command{kind: "INFO", args: _args}, %Ctx{config: %{replicaof: _}, client: client}),
-    do: :gen_tcp.send(client, encode("role:slave", @bulk_str) |> IO.inspect())
+  def exec(%Command{kind: "INFO", args: _args}, %Ctx{
+        config: %{replicaof: _} = config,
+        client: client
+      }) do
+    replication =
+      Map.take(config, [:master_replid, :master_repl_offset]) |> Map.merge(%{role: "slave"})
 
-  def exec(%Command{kind: "INFO", args: _args}, ctx),
-    do: :gen_tcp.send(ctx.client, encode("role:master", @bulk_str) |> IO.inspect())
+    res =
+      Enum.map_join(replication, "\n", fn {key, val} -> "#{key}:#{val}" end)
+      |> encode(@bulk_str)
+      |> IO.inspect()
+
+    :gen_tcp.send(client, res)
+  end
+
+  def exec(%Command{kind: "INFO", args: _args}, ctx) do
+    replication =
+      Map.take(ctx.config, [:master_replid, :master_repl_offset]) |> Map.merge(%{role: "master"})
+
+    res =
+      Enum.map_join(replication, "\n", fn {key, val} -> "#{key}:#{val}" end)
+      |> encode(@bulk_str)
+      |> IO.inspect()
+
+    :gen_tcp.send(ctx.client, res)
+  end
 
   def exec(unknown_cmd, ctx) do
     IO.inspect(unknown_cmd)
