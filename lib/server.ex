@@ -308,22 +308,22 @@ defmodule Server do
         |> Ctx.filepath()
         |> File.read!()
         |> Rdb.parse_file([])
-        |> Enum.filter(fn %Rdb.Section{kind: kind} -> kind == :kv_pair end)
-        |> IO.inspect(label: "kv_pairs")
-        |> Enum.find_value(fn %Rdb.Section{data: %{key: candidate, val: val} = data} ->
-          if candidate != key do
-            nil
-          else
-            case data do
-              %{expiretime: {e, time_unit}} ->
-                if e <= :os.system_time(time_unit),
-                  do: @null_bulk_str,
-                  else: encode(val, @bulk_str)
+        |> Enum.find_value(fn
+          %Rdb.Section{
+            kind: :kv_pair,
+            data: %{key: candidate, val: val, expiretime: {expiretime, time_unit}}
+          }
+          when candidate == key ->
+            if expiretime <= :os.system_time(time_unit),
+              do: @null_bulk_str,
+              else: encode(val, @bulk_str)
 
-              _ ->
-                encode(val, @bulk_str)
-            end
-          end
+          %Rdb.Section{kind: :kv_pair, data: %{key: candidate, val: val}}
+          when candidate == key ->
+            encode(val, @bulk_str)
+
+          _ ->
+            nil
         end)
         |> IO.inspect(label: "value for: " <> key)
       )
@@ -346,7 +346,10 @@ defmodule Server do
         |> File.read!()
         |> Rdb.parse_file([])
         |> IO.inspect(label: "sections")
-        |> Enum.filter(fn %Rdb.Section{kind: kind} -> kind == :kv_pair end)
+        |> Enum.filter(fn
+          %Rdb.Section{kind: :kv_pair} -> true
+          _ -> false
+        end)
         |> IO.inspect(label: "kv_pairs")
         |> Enum.map(fn %Rdb.Section{data: %{key: key}} -> key end)
         |> IO.inspect(label: "keys")
@@ -433,7 +436,7 @@ defmodule Server do
     [master_base, master_port] = String.split(replicaof)
 
     {:ok, master_socket} =
-      :gen_tcp.connect(to_charlist(master_base), String.to_integer(master_port), [
+      :gen_tcp.connect(~c"#{master_base}", String.to_integer(master_port), [
         :binary,
         active: false
       ])
