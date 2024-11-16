@@ -234,12 +234,8 @@ defmodule Server do
   def consume_digits(<<n, tl::binary>>, acc) when n in @digit,
     do: consume_digits(tl, <<acc::binary, n>>)
 
-  def encode(str, @simple_str),
-    do: <<@simple_str>> <> str <> @sep
-
-  def encode(str, @bulk_str),
-    do: <<@bulk_str>> <> "#{String.length(str)}" <> @sep <> str <> @sep
-
+  def encode(str, @simple_str), do: <<@simple_str>> <> str <> @sep
+  def encode(str, @bulk_str), do: <<@bulk_str>> <> "#{String.length(str)}" <> @sep <> str <> @sep
   def encode(array, @array), do: <<@array>> <> "#{Enum.count(array)}" <> @sep <> Enum.join(array)
 
   def ok, do: encode("OK", @simple_str)
@@ -394,9 +390,12 @@ defmodule Server do
     :gen_tcp.send(ctx.client, ok())
   end
 
-  def exec(%Command{kind: @psync, args: [replid, repl_offset]}, ctx) do
+  def exec(%Command{kind: @psync, args: [replid, repl_offset]}, %Ctx{
+        config: %{master_replid: master_replid},
+        client: client
+      }) do
     IO.puts("psync: #{replid}, #{repl_offset}")
-    :gen_tcp.send(ctx.client, "+FULLRESYNC <REPL_ID> 0\r\n")
+    :gen_tcp.send(client, encode("FULLRESYNC #{master_replid} 0", @simple_str))
   end
 
   def exec(unknown_cmd, ctx) do
