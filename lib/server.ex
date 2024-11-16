@@ -229,6 +229,9 @@ defmodule Server do
       |> Server.encode(@array)
       |> IO.inspect()
     end
+
+    def propagate?(%Command{kind: kind}) when kind in ["SET"], do: true
+    def propagate?(_), do: false
   end
 
   def start(_type, _args) do
@@ -428,9 +431,13 @@ defmodule Server do
       {:ok, data} ->
         command = command(data)
 
-        Agent.get(ReplicaSet, & &1)
-        |> Enum.map(&:gen_tcp.send(&1, Command.encode(command)))
-        |> IO.inspect(label: "propagation result")
+        # TODO: make concurrent
+        if Command.propagate?(command),
+          do:
+            Agent.get(ReplicaSet, & &1)
+            |> IO.inspect(label: "propagating to these replicas")
+            |> Enum.map(&:gen_tcp.send(&1, Command.encode(command)))
+            |> IO.inspect(label: "propagation result")
 
         exec(command, ctx)
 
