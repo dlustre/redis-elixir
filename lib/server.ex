@@ -175,9 +175,11 @@ defmodule Server do
 
   use Application
 
+  @default_config %{port: 6379}
+
   defmodule Ctx do
-    @enforce_keys [:config]
-    defstruct [:config, socket: nil, client: nil]
+    @default_config %{port: 6379}
+    defstruct socket: nil, client: nil, config: @default_config
 
     def config_get(%Ctx{config: config}, name) when is_atom(name), do: Map.fetch!(config, name)
 
@@ -200,10 +202,10 @@ defmodule Server do
     {args, _} =
       OptionParser.parse!(System.argv(),
         allow_nonexistent_atoms: true,
-        switches: [dir: :string, dbfilename: :string]
+        switches: [port: :integer, dir: :string, dbfilename: :string]
       )
 
-    ctx = %Ctx{config: Enum.into(args, %{})} |> IO.inspect()
+    ctx = %Ctx{config: Enum.into(args, @default_config)} |> IO.inspect()
 
     Supervisor.start_link([{Task, fn -> Server.listen(ctx) end}], strategy: :one_for_one)
   end
@@ -262,7 +264,7 @@ defmodule Server do
   end
 
   def exec(%Command{kind: "GET", args: [key]}, %Ctx{config: config, client: client})
-      when config == %{} do
+      when config == @default_config do
     value =
       case :ets.lookup(:redis, key) |> IO.inspect() do
         [{^key, value, expiration}] ->
@@ -372,7 +374,10 @@ defmodule Server do
   def listen(ctx) do
     # Since the tester restarts your program quite often, setting SO_REUSEADDR
     # ensures that we don't run into 'Address already in use' errors
-    {:ok, socket} = :gen_tcp.listen(6379, [:binary, active: false, reuseaddr: true])
+    {:ok, socket} =
+      :gen_tcp.listen(ctx.config.port, [:binary, active: false, reuseaddr: true])
+      |> IO.inspect(label: "Listening to port: #{ctx.config.port}")
+
     :ets.new(:redis, [:set, :public, :named_table])
 
     loop_acceptor(%Ctx{ctx | socket: socket})
