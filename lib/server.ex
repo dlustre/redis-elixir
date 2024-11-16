@@ -24,6 +24,12 @@ defmodule Rdb do
     defstruct [:kind, :data]
   end
 
+  def empty_file,
+    do:
+      Base.decode64!(
+        "UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZW3CsMQQAPoIYW9mLWJhc2XAAP/wbjv+wP9aog=="
+      )
+
   def test_length_encoding() do
     consume(<<0x0A>>, :length_encoded) |> elem(0) |> Util.assert_equals(10)
 
@@ -206,15 +212,13 @@ defmodule Server do
         [config_get(ctx, :dir), config_get(ctx, :dbfilename)]
         |> Path.join()
         |> IO.inspect(label: "Filepath")
+
+    def file(ctx), do: ctx |> filepath() |> File.read!()
   end
 
   defmodule Command do
     @enforce_keys [:kind, :args]
     defstruct [:kind, :args]
-    # def encode(%Command{kind: kind, args: args}), do:
-    #   [kind | args]
-    #   |> IO.inspect()
-    #   |>
   end
 
   def start(_type, _args) do
@@ -237,8 +241,12 @@ defmodule Server do
   def encode(str, @simple_str), do: <<@simple_str>> <> str <> @sep
   def encode(str, @bulk_str), do: <<@bulk_str>> <> "#{String.length(str)}" <> @sep <> str <> @sep
   def encode(array, @array), do: <<@array>> <> "#{Enum.count(array)}" <> @sep <> Enum.join(array)
+  def encode_file(bin), do: <<@bulk_str>> <> "#{byte_size(bin)}" <> @sep <> bin
 
   def ok, do: encode("OK", @simple_str)
+
+  # def consume_simple_str(@sep <> <<tl::binary>>, acc), do: {acc, tl}
+  # def consume_simple_str(<<char::8-binary, tl::binary>>, acc), do: consume_simple_str(tl, acc <> "#{char}")
 
   def decode(<<@bulk_str, tl::binary>>) do
     {str_length, tl} = consume_digits(tl, <<>>)
@@ -300,10 +308,7 @@ defmodule Server do
     do:
       :gen_tcp.send(
         ctx.client,
-        ctx
-        |> Ctx.filepath()
-        |> File.read!()
-        |> Rdb.parse_file([])
+        Rdb.parse_file(Ctx.file(ctx), [])
         |> Enum.find_value(fn
           %Rdb.Section{
             kind: :kv_pair,
@@ -337,10 +342,7 @@ defmodule Server do
     do:
       :gen_tcp.send(
         ctx.client,
-        ctx
-        |> Ctx.filepath()
-        |> File.read!()
-        |> Rdb.parse_file([])
+        Rdb.parse_file(Ctx.file(ctx), [])
         |> IO.inspect(label: "sections")
         |> Enum.filter(fn
           %Rdb.Section{kind: :kv_pair} -> true
@@ -390,12 +392,16 @@ defmodule Server do
     :gen_tcp.send(ctx.client, ok())
   end
 
-  def exec(%Command{kind: @psync, args: [replid, repl_offset]}, %Ctx{
-        config: %{master_replid: master_replid},
-        client: client
-      }) do
+  def exec(
+        %Command{kind: @psync, args: [replid, repl_offset]},
+        %Ctx{config: %{master_replid: master_replid}, client: client}
+      ) do
     IO.puts("psync: #{replid}, #{repl_offset}")
-    :gen_tcp.send(client, encode("FULLRESYNC #{master_replid} 0", @simple_str))
+
+    :ok =
+      :gen_tcp.send(client, encode("FULLRESYNC #{master_replid} 0", @simple_str) |> IO.inspect())
+
+    :gen_tcp.send(client, Rdb.empty_file() |> encode_file())
   end
 
   def exec(unknown_cmd, ctx) do
@@ -463,7 +469,9 @@ defmodule Server do
     {:ok, ^ok_res} = :gen_tcp.recv(master_socket, 0) |> IO.inspect(label: "recv ok for capa")
 
     :gen_tcp.send(master_socket, encode_command.([@psync, "?", "-1"]))
-    {:ok, psync_res} = :gen_tcp.recv(master_socket, 0) |> IO.inspect(label: "psync res")
+
+    {:ok, _} =
+      :gen_tcp.recv(master_socket, 0) |> IO.inspect(label: "psync and file res")
 
     :ets.new(:redis, [:set, :public, :named_table])
 
