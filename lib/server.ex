@@ -172,6 +172,7 @@ defmodule Server do
   @sep "\r\n"
   @digit ?0..?9
   @null_bulk_str "$-1\r\n"
+  @pong "+PONG\r\n"
 
   use Application
 
@@ -235,6 +236,8 @@ defmodule Server do
 
   def encode(array, @array), do: <<@array>> <> "#{Enum.count(array)}" <> @sep <> Enum.join(array)
 
+  def ok, do: encode("OK", @simple_str)
+
   def decode(<<@bulk_str, tl::binary>>) do
     {str_length, tl} = consume_digits(tl, <<>>)
     <<str::size(str_length)-unit(8)-binary, @sep, tl::binary>> = tl
@@ -259,7 +262,7 @@ defmodule Server do
     %Command{kind: kind, args: Enum.reverse(args)} |> IO.inspect()
   end
 
-  def exec(%Command{kind: "PING"}, ctx), do: :gen_tcp.send(ctx.client, "+PONG\r\n")
+  def exec(%Command{kind: "PING"}, ctx), do: :gen_tcp.send(ctx.client, @pong)
 
   def exec(%Command{kind: "ECHO", args: [msg]}, ctx),
     do: :gen_tcp.send(ctx.client, encode(msg, @bulk_str))
@@ -267,12 +270,12 @@ defmodule Server do
   def exec(%Command{kind: "SET", args: [key, value, "px", expiry_ms]}, ctx) do
     expiration = :os.system_time(:millisecond) + String.to_integer(expiry_ms)
     true = :ets.insert(:redis, {key, value, expiration})
-    :gen_tcp.send(ctx.client, encode("OK", @simple_str))
+    :gen_tcp.send(ctx.client, ok())
   end
 
   def exec(%Command{kind: "SET", args: [key, value]}, ctx) do
     true = :ets.insert(:redis, {key, value})
-    :gen_tcp.send(ctx.client, encode("OK", @simple_str))
+    :gen_tcp.send(ctx.client, ok())
   end
 
   def exec(%Command{kind: "GET", args: [key]}, %Ctx{config: config, client: client})
@@ -372,6 +375,16 @@ defmodule Server do
     :gen_tcp.send(ctx.client, res)
   end
 
+  def exec(%Command{kind: "REPLCONF", args: ["capa", capa]}, ctx) do
+    IO.puts("capa: #{capa}")
+    :gen_tcp.send(ctx.client, ok())
+  end
+
+  def exec(%Command{kind: "REPLCONF", args: ["listening-port", listening_port]}, ctx) do
+    IO.puts("listening-port: #{listening_port}")
+    :gen_tcp.send(ctx.client, ok())
+  end
+
   def exec(unknown_cmd, ctx) do
     IO.inspect(unknown_cmd)
     IO.inspect(ctx)
@@ -406,13 +419,42 @@ defmodule Server do
       :gen_tcp.listen(port, [:binary, active: false, reuseaddr: true])
       |> IO.inspect(label: "Listening to port: #{port}")
 
-    [base, port] = String.split(replicaof)
+    [master_base, master_port] = String.split(replicaof)
 
     {:ok, master_socket} =
-      :gen_tcp.connect(to_charlist(base), String.to_integer(port), [:binary, active: false])
+      :gen_tcp.connect(to_charlist(master_base), String.to_integer(master_port), [
+        :binary,
+        active: false
+      ])
       |> IO.inspect(label: "connected to #{replicaof}")
 
     :gen_tcp.send(master_socket, [encode("PING", @bulk_str)] |> encode(@array) |> IO.inspect())
+
+    {:ok, @pong} =
+      :gen_tcp.recv(master_socket, 0) |> IO.inspect(label: "recv pong for ping")
+
+    :gen_tcp.send(
+      master_socket,
+      ["REPLCONF", "listening-port", "#{port}"]
+      |> Enum.map(&encode(&1, @bulk_str))
+      |> encode(@array)
+      |> IO.inspect()
+    )
+
+    ok_res = ok()
+
+    {:ok, ^ok_res} =
+      :gen_tcp.recv(master_socket, 0) |> IO.inspect(label: "recv ok for listening-port")
+
+    :gen_tcp.send(
+      master_socket,
+      ["REPLCONF", "capa", "psync2"]
+      |> Enum.map(&encode(&1, @bulk_str))
+      |> encode(@array)
+      |> IO.inspect()
+    )
+
+    {:ok, ^ok_res} = :gen_tcp.recv(master_socket, 0) |> IO.inspect(label: "recv ok for capa")
 
     :ets.new(:redis, [:set, :public, :named_table])
 
