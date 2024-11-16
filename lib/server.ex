@@ -165,10 +165,16 @@ defmodule Rdb do
 end
 
 defmodule Server do
+  # Encodings.
   @array ?*
   @simple_str ?+
   @bulk_str ?$
 
+  # Commands.
+  @replconf "REPLCONF"
+  @psync "PSYNC"
+
+  # Utils.
   @sep "\r\n"
   @digit ?0..?9
   @null_bulk_str "$-1\r\n"
@@ -375,14 +381,19 @@ defmodule Server do
     :gen_tcp.send(ctx.client, res)
   end
 
-  def exec(%Command{kind: "REPLCONF", args: ["capa", capa]}, ctx) do
-    IO.puts("capa: #{capa}")
+  def exec(%Command{kind: @replconf, args: ["capa" | _] = capabilities}, ctx) do
+    IO.puts("capa: #{capabilities}")
     :gen_tcp.send(ctx.client, ok())
   end
 
-  def exec(%Command{kind: "REPLCONF", args: ["listening-port", listening_port]}, ctx) do
+  def exec(%Command{kind: @replconf, args: ["listening-port", listening_port]}, ctx) do
     IO.puts("listening-port: #{listening_port}")
     :gen_tcp.send(ctx.client, ok())
+  end
+
+  def exec(%Command{kind: @psync, args: [replid, repl_offset]}, ctx) do
+    IO.puts("psync: #{replid}, #{repl_offset}")
+    :gen_tcp.send(ctx.client, "+FULLRESYNC <REPL_ID> 0\r\n")
   end
 
   def exec(unknown_cmd, ctx) do
@@ -433,28 +444,24 @@ defmodule Server do
     {:ok, @pong} =
       :gen_tcp.recv(master_socket, 0) |> IO.inspect(label: "recv pong for ping")
 
-    :gen_tcp.send(
-      master_socket,
-      ["REPLCONF", "listening-port", "#{port}"]
-      |> Enum.map(&encode(&1, @bulk_str))
-      |> encode(@array)
-      |> IO.inspect()
-    )
-
     ok_res = ok()
 
-    {:ok, ^ok_res} =
-      :gen_tcp.recv(master_socket, 0) |> IO.inspect(label: "recv ok for listening-port")
+    encode_command =
+      fn args ->
+        args
+        |> Enum.map(&encode(&1, @bulk_str))
+        |> encode(@array)
+        |> IO.inspect()
+      end
 
-    :gen_tcp.send(
-      master_socket,
-      ["REPLCONF", "capa", "psync2"]
-      |> Enum.map(&encode(&1, @bulk_str))
-      |> encode(@array)
-      |> IO.inspect()
-    )
+    :gen_tcp.send(master_socket, encode_command.([@replconf, "listening-port", "#{port}"]))
+    {:ok, ^ok_res} = :gen_tcp.recv(master_socket, 0) |> IO.inspect(label: "listening-port res")
 
+    :gen_tcp.send(master_socket, encode_command.([@replconf, "capa", "eof", "capa", "psync2"]))
     {:ok, ^ok_res} = :gen_tcp.recv(master_socket, 0) |> IO.inspect(label: "recv ok for capa")
+
+    :gen_tcp.send(master_socket, encode_command.([@psync, "?", "-1"]))
+    {:ok, psync_res} = :gen_tcp.recv(master_socket, 0) |> IO.inspect(label: "psync res")
 
     :ets.new(:redis, [:set, :public, :named_table])
 
