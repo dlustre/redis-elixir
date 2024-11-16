@@ -339,6 +339,9 @@ defmodule Server do
         |> encode(@array)
       )
 
+  def exec(%Command{kind: "INFO", args: _args}, %Ctx{config: %{replicaof: _}, client: client}),
+    do: :gen_tcp.send(client, encode("role:slave", @bulk_str) |> IO.inspect())
+
   def exec(%Command{kind: "INFO", args: _args}, ctx),
     do: :gen_tcp.send(ctx.client, encode("role:master", @bulk_str) |> IO.inspect())
 
