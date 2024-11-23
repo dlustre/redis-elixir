@@ -122,19 +122,12 @@ defmodule Server do
   #   consume_commands(tl, [command | acc])
   # end
 
-  def enqueue_commands(_, <<>>), do: IO.inspect("finished queueing commands")
+  def handle_commands(<<>>, _), do: IO.inspect("finished queueing commands")
 
-  def enqueue_commands(ctx, bin) do
+  def handle_commands(bin, func) do
     {command, tl} = command(bin)
-
-    # Hack since test expects getack response instantly.
-    if command.kind in [@replconf] do
-      exec(command, ctx)
-    else
-      Queue.enqueue(command)
-    end
-
-    enqueue_commands(ctx, tl)
+    func.(command)
+    handle_commands(tl, func)
   end
 
   def ok, do: Resp.encode("OK", @simple_str)
@@ -326,7 +319,7 @@ defmodule Server do
     case :gen_tcp.recv(ctx.client, 0) do
       {:ok, data} ->
         IO.inspect("recvd as replica")
-        enqueue_commands(ctx, data)
+        handle_commands(data, &exec(&1, ctx))
         serve(ctx)
 
       {:error, :closed} ->
@@ -428,7 +421,7 @@ defmodule Server do
     {file, propagated_commands} = Resp.decode_file(encoded_file)
     {_, <<>>} = Rdb.parse_file(file, [])
 
-    enqueue_commands(%Ctx{ctx | client: master_socket}, propagated_commands)
+    handle_commands(propagated_commands, &exec(&1, %Ctx{ctx | client: master_socket}))
 
     Task.start_link(fn -> serve(%Ctx{ctx | client: master_socket}) end)
   end

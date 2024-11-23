@@ -24,10 +24,12 @@ defmodule Queue do
   end
 
   def handle_continue(:process_next_msg, %{queue: []} = state) do
+    IO.inspect("queue empty, processing stopped.")
     {:noreply, %{state | processing: false}}
   end
 
   def handle_continue(:process_next_msg, %{ctx: ctx, queue: [msg | tl]} = state) do
+    IO.inspect("processing msg in queue")
     Server.exec(msg, ctx)
     {:noreply, %{state | queue: tl}, {:continue, :process_next_msg}}
   end
