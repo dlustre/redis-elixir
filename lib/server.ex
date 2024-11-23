@@ -125,7 +125,7 @@ defmodule Server do
   def enqueue_commands(<<>>), do: IO.inspect("finished queueing commands")
 
   def enqueue_commands(bin) do
-    {command, tl} = Server.command(bin)
+    {command, tl} = command(bin)
     Queue.enqueue(command)
     enqueue_commands(tl)
   end
@@ -280,9 +280,18 @@ defmodule Server do
     :gen_tcp.send(ctx.client, ok())
   end
 
-  def exec(%Command{kind: @replconf, args: ["listening-port", listening_port]}, ctx) do
-    IO.puts("listening-port: #{listening_port}")
-    :gen_tcp.send(ctx.client, ok())
+  def exec(%Command{kind: @replconf, args: ["listening-port", _]}, ctx),
+    do: :gen_tcp.send(ctx.client, ok())
+
+  def exec(%Command{kind: @replconf, args: ["GETACK", "*"]}, ctx) do
+    IO.puts("getack: *")
+
+    :gen_tcp.send(
+      ctx.client,
+      [@replconf, "ACK", "0"]
+      |> Enum.map(&Resp.encode(&1, @bulk_str))
+      |> Resp.encode(@array)
+    )
   end
 
   def exec(
@@ -306,16 +315,15 @@ defmodule Server do
     raise "Unexpected command: " <> unknown_cmd.kind
   end
 
-  def serve(%Ctx{config: %{replicaof: _}} = ctx) do
+  def serve(_, tl \\ <<>>)
+
+  def serve(%Ctx{config: %{replicaof: _}} = ctx, <<>>) do
     case :gen_tcp.recv(ctx.client, 0) do
       {:ok, data} ->
-        # consume_commands(data, [])
-        # |> IO.inspect(label: "sent/propagated commands")
-        # |> Enum.map(&Queue.enqueue(&1))
-
-        enqueue_commands(data)
-
-        serve(ctx)
+        IO.inspect("recvd as replica")
+        {command, tl} = command(data)
+        Queue.enqueue(command)
+        serve(ctx, tl)
 
       {:error, :closed} ->
         IO.puts("Socket closed")
@@ -326,9 +334,22 @@ defmodule Server do
     end
   end
 
-  def serve(ctx) do
+  def serve(%Ctx{config: %{replicaof: _}} = ctx, tl) do
+    IO.inspect("handling leftovers as replica")
+    {command, tl} = command(tl)
+
+    if command.kind in [@replconf] do
+      exec(command, ctx)
+    else
+      Queue.enqueue(command)
+      serve(ctx, tl)
+    end
+  end
+
+  def serve(%Ctx{config: config} = ctx, _tl) when not is_map_key(config, :replicaof) do
     case :gen_tcp.recv(ctx.client, 0) do
       {:ok, data} ->
+        IO.inspect("recvd as master")
         {command, _tl} = command(data)
 
         # TODO: make concurrent
@@ -412,10 +433,10 @@ defmodule Server do
           file
       end
 
-    {file, <<>>} = Resp.decode_file(encoded_file)
+    {file, tl} = Resp.decode_file(encoded_file)
     {_, <<>>} = Rdb.parse_file(file, [])
 
-    Task.start_link(fn -> serve(%Ctx{ctx | client: master_socket}) end)
+    Task.start_link(fn -> serve(%Ctx{ctx | client: master_socket}, tl) end)
   end
 
   @doc """

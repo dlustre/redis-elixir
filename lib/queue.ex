@@ -12,13 +12,14 @@ defmodule Queue do
   end
 
   def handle_cast({:enqueue, msg}, %{processing: false} = state) do
-    IO.inspect(state.queue ++ [msg], label: "resulting queue")
+    IO.inspect(state.queue ++ [msg], label: "not busy. resulting queue")
 
     {:noreply, %{state | queue: state.queue ++ [msg], processing: true},
      {:continue, :process_next_msg}}
   end
 
   def handle_cast({:enqueue, msg}, %{processing: true} = state) do
+    IO.inspect(state.queue ++ [msg], label: "busy. resulting queue")
     {:noreply, %{state | queue: state.queue ++ [msg], processing: true}}
   end
 
