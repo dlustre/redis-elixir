@@ -1,175 +1,3 @@
-defmodule Util do
-  require(ExUnit.Assertions)
-
-  def assert_equals(actual, expected), do: ExUnit.Assertions.assert(actual == expected)
-end
-
-defmodule Rdb do
-  @header "REDIS0011"
-  @eof 0xFF
-  @selectdb 0xFE
-  @string 0x00
-  @expiretime 0xFD
-  @expiretime_ms 0xFC
-  @resizedb 0xFB
-  @aux 0xFA
-
-  @next_six <<0b00::2>>
-  @next_fourteen <<0b01::2>>
-  @next_thirty_two <<0b10::2>>
-  @special <<0b11::2>>
-
-  defmodule Section do
-    @enforce_keys [:kind, :data]
-    defstruct [:kind, :data]
-  end
-
-  def empty_file,
-    do:
-      Base.decode64!(
-        "UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZW3CsMQQAPoIYW9mLWJhc2XAAP/wbjv+wP9aog=="
-      )
-
-  def test_length_encoding() do
-    consume(<<0x0A>>, :length_encoded) |> elem(0) |> Util.assert_equals(10)
-
-    consume(<<0x42, 0xBC>>, :length_encoded)
-    |> elem(0)
-    |> Util.assert_equals(700)
-
-    consume(<<0x80, 0x00, 0x00, 0x42, 0x68>>, :length_encoded)
-    |> elem(0)
-    |> Util.assert_equals(17000)
-
-    consume(<<0b11::2>>, :length_encoded)
-  end
-
-  def test_str_encoding() do
-    consume(
-      <<0x0D, 0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x2C, 0x20, 0x57, 0x6F, 0x72, 0x6C, 0x64, 0x21>>,
-      :str_encoded
-    )
-    |> elem(0)
-    |> Util.assert_equals("Hello, World!")
-
-    consume(
-      <<0xC0, 0x7B, 0xFF>>,
-      :str_encoded
-    )
-    |> elem(0)
-    |> Util.assert_equals(123)
-
-    consume(
-      <<0xC1, 0x39, 0x30>>,
-      :str_encoded
-    )
-    |> elem(0)
-    |> Util.assert_equals(12345)
-
-    consume(
-      <<0xC2, 0x87, 0xD6, 0x12, 0x00>>,
-      :str_encoded
-    )
-    |> elem(0)
-    |> Util.assert_equals(1_234_567)
-  end
-
-  def consume(<<@next_six, length::6, tl::binary>>, :length_encoded),
-    do: {length, tl} |> IO.inspect(label: "length_encoded: next_six")
-
-  def consume(<<@next_fourteen, length::14, tl::binary>>, :length_encoded),
-    do: {length, tl} |> IO.inspect(label: "length_encoded: next_fourteen")
-
-  def consume(<<@next_thirty_two, _::6, length::32, tl::binary>>, :length_encoded),
-    do: {length, tl} |> IO.inspect(label: "length_encoded: next_thirty_two")
-
-  def consume(<<@special, str_format::6, tl::binary>>, :length_encoded) do
-    case str_format do
-      0 -> {:eight, tl}
-      1 -> {:sixteen, tl}
-      2 -> {:thirtytwo, tl}
-    end
-  end
-
-  def consume(bin, :str_encoded) do
-    case consume(bin, :length_encoded) do
-      {:eight, tl} ->
-        <<int, tl::binary>> = tl
-        {int, tl} |> IO.inspect(label: "str_encoded:eight")
-
-      {:sixteen, tl} ->
-        <<int::16-little, tl::binary>> = tl
-        {int, tl} |> IO.inspect(label: "str_encoded:sixteen")
-
-      {:thirtytwo, tl} ->
-        <<int::32-little, tl::binary>> = tl
-        {int, tl} |> IO.inspect(label: "str_encoded:thirtytwo")
-
-      {length, tl} ->
-        <<str::size(length)-binary, tl::binary>> = tl
-        {str, tl} |> IO.inspect(label: "str_encoded")
-    end
-  end
-
-  def parse(<<@eof, tl::binary>>) do
-    IO.puts("eof")
-    {%Section{kind: :eof, data: nil}, tl}
-  end
-
-  def parse(<<@selectdb, bin::binary>>) do
-    IO.puts("selectdb")
-    {db_index, tl} = consume(bin, :length_encoded) |> IO.inspect()
-    <<@resizedb, tl::binary>> = tl
-    {table_size, tl} = consume(tl, :length_encoded) |> IO.inspect()
-    {expire_table_size, tl} = consume(tl, :length_encoded) |> IO.inspect()
-
-    {%Section{
-       kind: :selectdb,
-       data: %{db_index: db_index, table_size: table_size, expire_table_size: expire_table_size}
-     }, tl}
-  end
-
-  def parse(<<@string, bin::binary>>) do
-    IO.puts("string no expiry")
-    {key, tl} = consume(bin, :str_encoded) |> IO.inspect()
-    {val, tl} = consume(tl, :str_encoded) |> IO.inspect()
-    {%Section{kind: :kv_pair, data: %{key: key, val: val}}, tl}
-  end
-
-  def parse(<<@expiretime, time::32-little, bin::binary>>) do
-    IO.puts("expiretime")
-    {key, tl} = consume(bin, :str_encoded) |> IO.inspect()
-    {val, tl} = consume(tl, :str_encoded) |> IO.inspect()
-    {%Section{kind: :kv_pair, data: %{key: key, val: val, expiretime: {time, :second}}}, tl}
-  end
-
-  def parse(<<@expiretime_ms, time::64-little, @string, bin::binary>>) do
-    IO.puts("expiretime_ms")
-    {key, tl} = consume(bin, :str_encoded) |> IO.inspect()
-    {val, tl} = consume(tl, :str_encoded) |> IO.inspect()
-    {%Section{kind: :kv_pair, data: %{key: key, val: val, expiretime: {time, :millisecond}}}, tl}
-  end
-
-  def parse(<<@aux, bin::binary>>) do
-    IO.puts("aux")
-    {key, tl} = consume(bin, :str_encoded) |> IO.inspect()
-    {val, tl} = consume(tl, :str_encoded) |> IO.inspect()
-    {%Section{kind: :aux, data: %{key: key, val: val}}, tl}
-  end
-
-  def parse(<<@header, tl::binary>>) do
-    IO.puts("header")
-    {%Section{kind: :header, data: nil}, tl}
-  end
-
-  def parse_file(bin, acc) do
-    case parse(bin) do
-      {%Section{kind: :eof} = section, _tl} -> Enum.reverse([section | acc])
-      {section, tl} -> parse_file(tl, [section |> IO.inspect() | acc])
-    end
-  end
-end
-
 default_config = %{
   port: 6379,
   master_replid: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
@@ -194,10 +22,51 @@ defmodule Server do
 
   # Utils.
   @sep "\r\n"
-  @digit ?0..?9
   @null_bulk_str "$-1\r\n"
   @pong "+PONG\r\n"
   @default_config default_config
+
+  defmodule Resp do
+    @array array
+    @simple_str simple_str
+    @bulk_str bulk_str
+    @sep "\r\n"
+
+    def consume_digits(<<@sep, tl::binary>>, acc), do: {String.to_integer(acc), tl}
+
+    def consume_digits(<<n, tl::binary>>, acc) when n in ?0..?9,
+      do: consume_digits(tl, <<acc::binary, n>>)
+
+    def consume_simple_str(@sep <> <<tl::binary>>, acc),
+      do: {acc, tl} |> IO.inspect(label: "simple string consumed")
+
+    def consume_simple_str(<<char::1-binary, tl::binary>>, acc),
+      do: consume_simple_str(tl, acc <> "#{char}")
+
+    def consume_simple_str(<<@simple_str, tl::binary>>), do: consume_simple_str(tl, "")
+
+    def encode(str, @simple_str), do: <<@simple_str>> <> str <> @sep
+
+    def encode(str, @bulk_str),
+      do: <<@bulk_str>> <> "#{String.length(str)}" <> @sep <> str <> @sep
+
+    def encode(array, @array),
+      do: <<@array>> <> "#{Enum.count(array)}" <> @sep <> Enum.join(array)
+
+    def encode_file(bin), do: <<@bulk_str>> <> "#{byte_size(bin)}" <> @sep <> bin
+
+    def decode(<<@bulk_str, tl::binary>>) do
+      {str_length, tl} = consume_digits(tl, <<>>)
+      <<str::size(str_length)-unit(8)-binary, @sep, tl::binary>> = tl
+      {str, tl}
+    end
+
+    def decode_file(<<@bulk_str, tl::binary>>) do
+      {file_length, tl} = consume_digits(tl, <<>>) |> IO.inspect()
+      <<file::size(file_length)-unit(8)-binary, tl::binary>> = tl
+      {file, tl}
+    end
+  end
 
   defmodule Ctx do
     defstruct socket: nil, client: nil, config: default_config
@@ -225,8 +94,8 @@ defmodule Server do
 
     def encode(%Command{kind: kind, args: args}) do
       [kind | args]
-      |> Enum.map(&Server.encode(&1, @bulk_str))
-      |> Server.encode(@array)
+      |> Enum.map(&Resp.encode(&1, @bulk_str))
+      |> Resp.encode(@array)
       |> IO.inspect()
     end
 
@@ -246,26 +115,22 @@ defmodule Server do
     Supervisor.start_link([{Task, fn -> Server.listen(ctx) end}], strategy: :one_for_one)
   end
 
-  def consume_digits(<<@sep, tl::binary>>, acc), do: {String.to_integer(acc), tl}
+  # def consume_commands(<<>>, acc), do: Enum.reverse(acc)
 
-  def consume_digits(<<n, tl::binary>>, acc) when n in @digit,
-    do: consume_digits(tl, <<acc::binary, n>>)
+  # def consume_commands(bin, acc) do
+  #   {command, tl} = Server.command(bin)
+  #   consume_commands(tl, [command | acc])
+  # end
 
-  def encode(str, @simple_str), do: <<@simple_str>> <> str <> @sep
-  def encode(str, @bulk_str), do: <<@bulk_str>> <> "#{String.length(str)}" <> @sep <> str <> @sep
-  def encode(array, @array), do: <<@array>> <> "#{Enum.count(array)}" <> @sep <> Enum.join(array)
-  def encode_file(bin), do: <<@bulk_str>> <> "#{byte_size(bin)}" <> @sep <> bin
+  def enqueue_commands(<<>>), do: IO.inspect("finished queueing commands")
 
-  def ok, do: encode("OK", @simple_str)
-
-  # def consume_simple_str(@sep <> <<tl::binary>>, acc), do: {acc, tl}
-  # def consume_simple_str(<<char::8-binary, tl::binary>>, acc), do: consume_simple_str(tl, acc <> "#{char}")
-
-  def decode(<<@bulk_str, tl::binary>>) do
-    {str_length, tl} = consume_digits(tl, <<>>)
-    <<str::size(str_length)-unit(8)-binary, @sep, tl::binary>> = tl
-    {str, tl}
+  def enqueue_commands(bin) do
+    {command, tl} = Server.command(bin)
+    Queue.enqueue(command)
+    enqueue_commands(tl)
   end
+
+  def ok, do: Resp.encode("OK", @simple_str)
 
   def command(
         <<@array, args_length_str::8-bitstring, @sep, @bulk_str, kind_length_str::8-bitstring,
@@ -275,80 +140,94 @@ defmodule Server do
     <<kind::size(kind_length)-unit(8)-binary, @sep, tl::binary>> = tl
     args_length = String.to_integer(args_length_str) - 1
 
-    {args, _tl} =
+    {args, tl} =
       List.duplicate(0, args_length)
       |> Enum.reduce({[], tl}, fn _, {args, bin} ->
-        {arg, tl} = decode(bin)
+        {arg, tl} = Resp.decode(bin)
         {[arg | args], tl}
       end)
 
-    %Command{kind: kind, args: Enum.reverse(args)} |> IO.inspect()
+    {%Command{kind: kind, args: Enum.reverse(args)}, tl} |> IO.inspect(label: "Parsed command")
+  end
+
+  def set(kv_pair) do
+    true = :ets.insert(:redis, kv_pair)
+    :ets.tab2list(:redis) |> IO.inspect(label: "result of set")
   end
 
   def exec(%Command{kind: "PING"}, ctx), do: :gen_tcp.send(ctx.client, @pong)
 
   def exec(%Command{kind: "ECHO", args: [msg]}, ctx),
-    do: :gen_tcp.send(ctx.client, encode(msg, @bulk_str))
+    do: :gen_tcp.send(ctx.client, Resp.encode(msg, @bulk_str))
 
   def exec(%Command{kind: "SET", args: [key, value, "px", expiry_ms]}, ctx) do
     expiration = :os.system_time(:millisecond) + String.to_integer(expiry_ms)
-    true = :ets.insert(:redis, {key, value, expiration})
-    :gen_tcp.send(ctx.client, ok())
+    set({key, value, expiration})
+    if !is_map_key(ctx.config, :replicaof), do: :gen_tcp.send(ctx.client, ok())
   end
 
   def exec(%Command{kind: "SET", args: [key, value]}, ctx) do
-    true = :ets.insert(:redis, {key, value})
-    :gen_tcp.send(ctx.client, ok())
+    set({key, value})
+    if !is_map_key(ctx.config, :replicaof), do: :gen_tcp.send(ctx.client, ok())
   end
 
-  def exec(%Command{kind: "GET", args: [key]}, %Ctx{config: config, client: client})
-      when config == @default_config do
+  def exec(
+        %Command{kind: "GET", args: [key]},
+        %Ctx{
+          config: %{dir: _, dbfilename: _},
+          client: client
+        } = ctx
+      ),
+      do:
+        :gen_tcp.send(
+          client,
+          Rdb.parse_file(Ctx.file(ctx), [])
+          |> elem(0)
+          |> Enum.find_value(fn
+            %Rdb.Section{
+              kind: :kv_pair,
+              data: %{key: candidate, val: val, expiretime: {expiretime, time_unit}}
+            }
+            when candidate == key ->
+              if expiretime <= :os.system_time(time_unit),
+                do: @null_bulk_str,
+                else: Resp.encode(val, @bulk_str)
+
+            %Rdb.Section{kind: :kv_pair, data: %{key: candidate, val: val}}
+            when candidate == key ->
+              Resp.encode(val, @bulk_str)
+
+            _ ->
+              nil
+          end)
+          |> IO.inspect(label: "value for: " <> key)
+        )
+
+  def exec(%Command{kind: "GET", args: [key]}, ctx) do
     value =
-      case :ets.lookup(:redis, key) |> IO.inspect() do
+      case :ets.lookup(:redis, key) |> IO.inspect(label: key <> " when looked up:") do
+        [] ->
+          raise "'#{key}' not found in ets"
+
         [{^key, value, expiration}] ->
           if expiration <= :os.system_time(:millisecond),
             do: @null_bulk_str,
-            else: encode(value, @bulk_str)
+            else: Resp.encode(value, @bulk_str)
 
         [{^key, value}] ->
-          encode(value, @bulk_str)
+          Resp.encode(value, @bulk_str)
       end
 
-    :gen_tcp.send(client, value)
+    :gen_tcp.send(ctx.client, value)
   end
-
-  def exec(%Command{kind: "GET", args: [key]}, ctx),
-    do:
-      :gen_tcp.send(
-        ctx.client,
-        Rdb.parse_file(Ctx.file(ctx), [])
-        |> Enum.find_value(fn
-          %Rdb.Section{
-            kind: :kv_pair,
-            data: %{key: candidate, val: val, expiretime: {expiretime, time_unit}}
-          }
-          when candidate == key ->
-            if expiretime <= :os.system_time(time_unit),
-              do: @null_bulk_str,
-              else: encode(val, @bulk_str)
-
-          %Rdb.Section{kind: :kv_pair, data: %{key: candidate, val: val}}
-          when candidate == key ->
-            encode(val, @bulk_str)
-
-          _ ->
-            nil
-        end)
-        |> IO.inspect(label: "value for: " <> key)
-      )
 
   def exec(%Command{kind: "CONFIG", args: ["GET", name]}, ctx),
     do:
       :gen_tcp.send(
         ctx.client,
         [name, Ctx.config_get(ctx, name)]
-        |> Enum.map(&encode(&1, @bulk_str))
-        |> encode(@array)
+        |> Enum.map(&Resp.encode(&1, @bulk_str))
+        |> Resp.encode(@array)
       )
 
   def exec(%Command{kind: "KEYS", args: ["*"]}, ctx),
@@ -356,6 +235,7 @@ defmodule Server do
       :gen_tcp.send(
         ctx.client,
         Rdb.parse_file(Ctx.file(ctx), [])
+        |> elem(0)
         |> IO.inspect(label: "sections")
         |> Enum.filter(fn
           %Rdb.Section{kind: :kv_pair} -> true
@@ -364,8 +244,8 @@ defmodule Server do
         |> IO.inspect(label: "kv_pairs")
         |> Enum.map(fn %Rdb.Section{data: %{key: key}} -> key end)
         |> IO.inspect(label: "keys")
-        |> Enum.map(&encode(&1, @bulk_str))
-        |> encode(@array)
+        |> Enum.map(&Resp.encode(&1, @bulk_str))
+        |> Resp.encode(@array)
       )
 
   def exec(%Command{kind: "INFO", args: _args}, %Ctx{
@@ -377,7 +257,7 @@ defmodule Server do
 
     res =
       Enum.map_join(replication, "\n", fn {key, val} -> "#{key}:#{val}" end)
-      |> encode(@bulk_str)
+      |> Resp.encode(@bulk_str)
       |> IO.inspect()
 
     :gen_tcp.send(client, res)
@@ -389,7 +269,7 @@ defmodule Server do
 
     res =
       Enum.map_join(replication, "\n", fn {key, val} -> "#{key}:#{val}" end)
-      |> encode(@bulk_str)
+      |> Resp.encode(@bulk_str)
       |> IO.inspect()
 
     :gen_tcp.send(ctx.client, res)
@@ -411,8 +291,8 @@ defmodule Server do
       ) do
     IO.puts("psync: #{replid}, #{repl_offset}")
 
-    :ok = :gen_tcp.send(client, encode("FULLRESYNC #{master_replid} 0", @simple_str))
-    :ok = :gen_tcp.send(client, Rdb.empty_file() |> encode_file())
+    :ok = :gen_tcp.send(client, Resp.encode("FULLRESYNC #{master_replid} 0", @simple_str))
+    :ok = :gen_tcp.send(client, Rdb.empty_file() |> Resp.encode_file())
 
     Agent.update(ReplicaSet, fn rs -> MapSet.put(rs, client) end)
 
@@ -426,10 +306,30 @@ defmodule Server do
     raise "Unexpected command: " <> unknown_cmd.kind
   end
 
+  def serve(%Ctx{config: %{replicaof: _}} = ctx) do
+    case :gen_tcp.recv(ctx.client, 0) do
+      {:ok, data} ->
+        # consume_commands(data, [])
+        # |> IO.inspect(label: "sent/propagated commands")
+        # |> Enum.map(&Queue.enqueue(&1))
+
+        enqueue_commands(data)
+
+        serve(ctx)
+
+      {:error, :closed} ->
+        IO.puts("Socket closed")
+
+      msg ->
+        IO.inspect(msg)
+        raise "Unknown"
+    end
+  end
+
   def serve(ctx) do
     case :gen_tcp.recv(ctx.client, 0) do
       {:ok, data} ->
-        command = command(data)
+        {command, _tl} = command(data)
 
         # TODO: make concurrent
         if Command.propagate?(command),
@@ -440,26 +340,29 @@ defmodule Server do
             |> IO.inspect(label: "propagation result")
 
         exec(command, ctx)
+        serve(ctx)
 
       {:error, :closed} ->
         IO.puts("Socket closed")
-        nil
 
       msg ->
         IO.inspect(msg)
         raise "Unknown"
     end
-
-    serve(ctx)
   end
 
   def loop_acceptor(ctx) do
     {:ok, client} = :gen_tcp.accept(ctx.socket)
-    Task.start_link(fn -> serve(%Ctx{ctx | client: client}) end)
+
+    Task.start_link(fn ->
+      Queue.start_link(%Ctx{ctx | client: client})
+      serve(%Ctx{ctx | client: client})
+    end)
+
     loop_acceptor(ctx)
   end
 
-  def send_handshake(%Ctx{config: %{port: port, replicaof: replicaof}}) do
+  def send_handshake(%Ctx{config: %{port: port, replicaof: replicaof}} = ctx) do
     [master_base, master_port] = String.split(replicaof)
 
     {:ok, master_socket} =
@@ -469,7 +372,10 @@ defmodule Server do
       ])
       |> IO.inspect(label: "connected to #{replicaof}")
 
-    :gen_tcp.send(master_socket, [encode("PING", @bulk_str)] |> encode(@array) |> IO.inspect())
+    :gen_tcp.send(
+      master_socket,
+      [Resp.encode("PING", @bulk_str)] |> Resp.encode(@array) |> IO.inspect()
+    )
 
     {:ok, @pong} =
       :gen_tcp.recv(master_socket, 0) |> IO.inspect(label: "recv pong for ping")
@@ -481,19 +387,35 @@ defmodule Server do
       Command.encode(%Command{kind: @replconf, args: ["listening-port", "#{port}"]})
     )
 
-    {:ok, ^ok_res} = :gen_tcp.recv(master_socket, 0) |> IO.inspect(label: "listening-port res")
+    {:ok, ^ok_res} = :gen_tcp.recv(master_socket, 0)
 
     :gen_tcp.send(
       master_socket,
       Command.encode(%Command{kind: @replconf, args: ["capa", "eof", "capa", "psync2"]})
     )
 
-    {:ok, ^ok_res} = :gen_tcp.recv(master_socket, 0) |> IO.inspect(label: "recv ok for capa")
+    {:ok, ^ok_res} = :gen_tcp.recv(master_socket, 0)
 
     :gen_tcp.send(master_socket, Command.encode(%Command{kind: @psync, args: ["?", "-1"]}))
 
-    {:ok, _} =
-      :gen_tcp.recv(master_socket, 0) |> IO.inspect(label: "psync and file res")
+    {:ok, res} = :gen_tcp.recv(master_socket, 0)
+
+    encoded_file =
+      case Resp.consume_simple_str(res) do
+        {_, ""} ->
+          IO.puts("need to recv file")
+          {:ok, file} = :gen_tcp.recv(master_socket, 0)
+          file
+
+        {_, file} ->
+          IO.puts("file already sent")
+          file
+      end
+
+    {file, <<>>} = Resp.decode_file(encoded_file)
+    {_, <<>>} = Rdb.parse_file(file, [])
+
+    Task.start_link(fn -> serve(%Ctx{ctx | client: master_socket}) end)
   end
 
   @doc """
