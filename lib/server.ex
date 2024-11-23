@@ -122,12 +122,19 @@ defmodule Server do
   #   consume_commands(tl, [command | acc])
   # end
 
-  def enqueue_commands(<<>>), do: IO.inspect("finished queueing commands")
+  def enqueue_commands(_, <<>>), do: IO.inspect("finished queueing commands")
 
-  def enqueue_commands(bin) do
+  def enqueue_commands(ctx, bin) do
     {command, tl} = command(bin)
-    Queue.enqueue(command)
-    enqueue_commands(tl)
+
+    # Hack since test expects getack response instantly.
+    if command.kind in [@replconf] do
+      exec(command, ctx)
+    else
+      Queue.enqueue(command)
+    end
+
+    enqueue_commands(ctx, tl)
   end
 
   def ok, do: Resp.encode("OK", @simple_str)
@@ -315,15 +322,12 @@ defmodule Server do
     raise "Unexpected command: " <> unknown_cmd.kind
   end
 
-  def serve(_, tl \\ <<>>)
-
-  def serve(%Ctx{config: %{replicaof: _}} = ctx, <<>>) do
+  def serve(%Ctx{config: %{replicaof: _}} = ctx) do
     case :gen_tcp.recv(ctx.client, 0) do
       {:ok, data} ->
         IO.inspect("recvd as replica")
-        {command, tl} = command(data)
-        Queue.enqueue(command)
-        serve(ctx, tl)
+        enqueue_commands(ctx, data)
+        serve(ctx)
 
       {:error, :closed} ->
         IO.puts("Socket closed")
@@ -334,19 +338,7 @@ defmodule Server do
     end
   end
 
-  def serve(%Ctx{config: %{replicaof: _}} = ctx, tl) do
-    IO.inspect("handling leftovers as replica")
-    {command, tl} = command(tl)
-
-    if command.kind in [@replconf] do
-      exec(command, ctx)
-    else
-      Queue.enqueue(command)
-      serve(ctx, tl)
-    end
-  end
-
-  def serve(%Ctx{config: config} = ctx, _tl) when not is_map_key(config, :replicaof) do
+  def serve(%Ctx{config: config} = ctx) when not is_map_key(config, :replicaof) do
     case :gen_tcp.recv(ctx.client, 0) do
       {:ok, data} ->
         IO.inspect("recvd as master")
@@ -433,10 +425,12 @@ defmodule Server do
           file
       end
 
-    {file, tl} = Resp.decode_file(encoded_file)
+    {file, propagated_commands} = Resp.decode_file(encoded_file)
     {_, <<>>} = Rdb.parse_file(file, [])
 
-    Task.start_link(fn -> serve(%Ctx{ctx | client: master_socket}, tl) end)
+    enqueue_commands(%Ctx{ctx | client: master_socket}, propagated_commands)
+
+    Task.start_link(fn -> serve(%Ctx{ctx | client: master_socket}) end)
   end
 
   @doc """
