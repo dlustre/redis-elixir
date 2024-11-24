@@ -285,7 +285,7 @@ defmodule Server do
 
   def do_exec(%Command{kind: @replconf, args: ["ACK", _offset_at_ack]}, ctx) do
     Agent.update(ReplicaMap, &Map.update!(&1, ctx.client, fn _ -> %{in_sync: true} end))
-    |> IO.inspect(label: "got ack from client (#{ctx.client}), setting as in_sync")
+    |> IO.inspect(label: "got ack from client, setting as in_sync")
 
     send(self(), :ack)
   end
