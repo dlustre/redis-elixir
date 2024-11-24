@@ -7,6 +7,7 @@ default_config = %{
 array = ?*
 simple_str = ?+
 bulk_str = ?$
+integer = ?:
 
 defmodule Server do
   use Application
@@ -15,6 +16,7 @@ defmodule Server do
   @array array
   @simple_str simple_str
   @bulk_str bulk_str
+  @integer integer
 
   # Commands.
   @replconf "REPLCONF"
@@ -30,6 +32,7 @@ defmodule Server do
     @array array
     @simple_str simple_str
     @bulk_str bulk_str
+    @integer integer
     @sep "\r\n"
 
     def consume_digits(<<@sep, tl::binary>>, acc), do: {String.to_integer(acc), tl}
@@ -45,6 +48,7 @@ defmodule Server do
 
     def consume_simple_str(<<@simple_str, tl::binary>>), do: consume_simple_str(tl, "")
 
+    def encode(int, @integer), do: <<@integer>> <> Integer.to_string(int) <> @sep
     def encode(str, @simple_str), do: <<@simple_str>> <> str <> @sep
 
     def encode(str, @bulk_str),
@@ -121,7 +125,6 @@ defmodule Server do
 
   def handle_commands(bin, func) do
     {command, tl} = command(bin)
-    IO.inspect("Here")
     func.(command)
 
     Agent.update(Config, fn config ->
@@ -263,28 +266,22 @@ defmodule Server do
     :gen_tcp.send(ctx.client, res)
   end
 
-  def do_exec(%Command{kind: @replconf, args: ["capa" | _] = capabilities}, ctx) do
-    IO.puts("capa: #{capabilities}")
-    :gen_tcp.send(ctx.client, ok())
-  end
+  def do_exec(%Command{kind: @replconf, args: ["capa" | _]}, ctx),
+    do: :gen_tcp.send(ctx.client, ok())
 
   def do_exec(%Command{kind: @replconf, args: ["listening-port", _]}, ctx),
     do: :gen_tcp.send(ctx.client, ok())
 
-  def do_exec(%Command{kind: @replconf, args: ["GETACK", "*"]}, %Ctx{client: client}) do
-    IO.puts("getack: *")
+  def do_exec(%Command{kind: @replconf, args: ["GETACK", "*"]}, %Ctx{client: client}),
+    do:
+      :gen_tcp.send(
+        client,
+        [@replconf, "ACK", config_fetch!(:master_repl_offset) |> Integer.to_string()]
+        |> Enum.map(&Resp.encode(&1, @bulk_str))
+        |> Resp.encode(@array)
+      )
 
-    :gen_tcp.send(
-      client,
-      [@replconf, "ACK", config_fetch!(:master_repl_offset) |> Integer.to_string()]
-      |> Enum.map(&Resp.encode(&1, @bulk_str))
-      |> Resp.encode(@array)
-    )
-  end
-
-  def do_exec(%Command{kind: @psync, args: [replid, repl_offset]}, ctx) do
-    IO.puts("psync: #{replid}, #{repl_offset}")
-
+  def do_exec(%Command{kind: @psync, args: [_replid, _repl_offset]}, ctx) do
     :ok =
       :gen_tcp.send(
         ctx.client,
@@ -297,6 +294,10 @@ defmodule Server do
 
     Agent.get(ReplicaSet, & &1)
     |> IO.inspect(label: "psync successful, adding client to replicaset")
+  end
+
+  def do_exec(%Command{kind: "WAIT", args: ["0", _]}, ctx) do
+    :ok = :gen_tcp.send(ctx.client, Resp.encode(0, @integer))
   end
 
   def do_exec(unknown_cmd, ctx) do
