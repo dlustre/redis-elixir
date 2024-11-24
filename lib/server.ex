@@ -89,6 +89,9 @@ defmodule Server do
   def is_config_key?(key), do: Agent.get(Config, &Map.has_key?(&1, key))
   def is_replica?(), do: is_config_key?(:replicaof)
 
+  def get_synced_replicas(),
+    do: Agent.get(ReplicaMap, &Enum.count(&1, fn {_, %{in_sync: in_sync}} -> in_sync end))
+
   defmodule Command do
     @array array
     @bulk_str bulk_str
@@ -167,7 +170,6 @@ defmodule Server do
   end
 
   def do_exec(%Command{kind: "PING"}, ctx) do
-    IO.inspect(is_replica?(), label: "ping")
     if not is_replica?(), do: :gen_tcp.send(ctx.client, @pong)
   end
 
@@ -272,14 +274,21 @@ defmodule Server do
   def do_exec(%Command{kind: @replconf, args: ["listening-port", _]}, ctx),
     do: :gen_tcp.send(ctx.client, ok())
 
-  def do_exec(%Command{kind: @replconf, args: ["GETACK", "*"]}, %Ctx{client: client}),
+  def do_exec(%Command{kind: @replconf, args: ["GETACK", "*"]}, ctx),
     do:
       :gen_tcp.send(
-        client,
+        ctx.client,
         [@replconf, "ACK", config_fetch!(:master_repl_offset) |> Integer.to_string()]
         |> Enum.map(&Resp.encode(&1, @bulk_str))
         |> Resp.encode(@array)
       )
+
+  def do_exec(%Command{kind: @replconf, args: ["ACK", _offset_at_ack]}, ctx) do
+    Agent.update(ReplicaMap, &Map.update!(&1, ctx.client, fn _ -> %{in_sync: true} end))
+    |> IO.inspect(label: "got ack from client (#{ctx.client}), setting as in_sync")
+
+    send(self(), :ack)
+  end
 
   def do_exec(%Command{kind: @psync, args: [_replid, _repl_offset]}, ctx) do
     :ok =
@@ -290,21 +299,56 @@ defmodule Server do
 
     :ok = :gen_tcp.send(ctx.client, Rdb.empty_file() |> Resp.encode_file())
 
-    Agent.update(ReplicaSet, &MapSet.put(&1, ctx.client))
+    Agent.update(ReplicaMap, &Map.put(&1, ctx.client, %{in_sync: true}))
 
-    Agent.get(ReplicaSet, & &1)
-    |> IO.inspect(label: "psync successful, adding client to replicaset")
+    Agent.get(ReplicaMap, & &1)
+    |> IO.inspect(label: "psync successful, adding client to ReplicaMap")
   end
 
-  def do_exec(%Command{kind: "WAIT", args: [_, _]}, ctx) do
-    replica_count = Agent.get(ReplicaSet, &Enum.count(&1))
-    :ok = :gen_tcp.send(ctx.client, Resp.encode(replica_count, @integer))
+  def do_exec(%Command{kind: "WAIT", args: args}, ctx) do
+    synced_replicas =
+      get_synced_replicas() |> IO.inspect(label: "synced replicas at time of wait cmd")
+
+    [acks_required, timeout_ms] =
+      args |> Enum.map(&String.to_integer/1) |> IO.inspect(label: "parsed args")
+
+    if synced_replicas >= acks_required do
+      :ok = :gen_tcp.send(ctx.client, Resp.encode(synced_replicas, @integer))
+    else
+      Agent.get(ReplicaMap, &Map.keys(&1))
+      |> IO.inspect(label: "sending getack to these replicas")
+      |> Enum.map(
+        &:gen_tcp.send(&1, Command.encode(%Command{kind: @replconf, args: ["GETACK", "*"]}))
+      )
+      |> IO.inspect(label: "getack stream result")
+
+      _ = await_acks(acks_required, timeout_ms)
+      :ok = :gen_tcp.send(ctx.client, Resp.encode(get_synced_replicas(), @integer))
+    end
   end
 
   def do_exec(unknown_cmd, ctx) do
     IO.inspect(unknown_cmd)
     IO.inspect(ctx)
     raise "Unexpected command: " <> unknown_cmd.kind
+  end
+
+  def await_acks(0, _),
+    do: :satisfied_all_acks |> IO.inspect(label: "finished awaiting target acks")
+
+  def await_acks(acks_left, timeout_ms) do
+    start = System.monotonic_time(:millisecond)
+
+    receive do
+      :ack ->
+        IO.inspect("received ack, need #{acks_left - 1} more")
+        elapsed = System.monotonic_time(:millisecond) - start
+        remaining_timeout = max(timeout_ms - elapsed, 0)
+        await_acks(acks_left - 1, remaining_timeout)
+    after
+      timeout_ms ->
+        :timed_out |> IO.inspect(label: "await_acks timed out, exiting")
+    end
   end
 
   def serve(ctx) do
@@ -315,7 +359,10 @@ defmodule Server do
           # TODO: make concurrent
           if not is_replica?() and Command.propagate?(command),
             do:
-              Agent.get(ReplicaSet, & &1)
+              Agent.get_and_update(ReplicaMap, fn map ->
+                IO.inspect(map, label: "desyncing replicas")
+                {Map.keys(map), Map.new(map, fn {k, v} -> {k, %{v | in_sync: false}} end)}
+              end)
               |> IO.inspect(label: "propagating to these replicas")
               |> Enum.map(&:gen_tcp.send(&1, Command.encode(command)))
               |> IO.inspect(label: "propagation result")
@@ -401,6 +448,8 @@ defmodule Server do
     ctx = %Ctx{ctx | client: master_socket}
 
     handle_commands(propagated_commands, &exec(&1, ctx))
+    |> IO.inspect(label: "handled commands appended to handshake")
+
     Task.start_link(fn -> serve(ctx) end)
   end
 
@@ -423,8 +472,8 @@ defmodule Server do
     :ets.new(:redis, [:set, :public, :named_table])
 
     {:ok, _} =
-      Agent.start_link(&MapSet.new/0, name: ReplicaSet)
-      |> IO.inspect(label: "started replicaset agent")
+      Agent.start_link(&Map.new/0, name: ReplicaMap)
+      |> IO.inspect(label: "started ReplicaMap agent")
 
     loop_acceptor(%Ctx{ctx | socket: socket})
   end
