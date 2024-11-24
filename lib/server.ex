@@ -296,8 +296,9 @@ defmodule Server do
     |> IO.inspect(label: "psync successful, adding client to replicaset")
   end
 
-  def do_exec(%Command{kind: "WAIT", args: ["0", _]}, ctx) do
-    :ok = :gen_tcp.send(ctx.client, Resp.encode(0, @integer))
+  def do_exec(%Command{kind: "WAIT", args: [_, _]}, ctx) do
+    replica_count = Agent.get(ReplicaSet, &Enum.count(&1))
+    :ok = :gen_tcp.send(ctx.client, Resp.encode(replica_count, @integer))
   end
 
   def do_exec(unknown_cmd, ctx) do
