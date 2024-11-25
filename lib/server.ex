@@ -78,14 +78,9 @@ defmodule Server do
 
   def config_fetch!(key), do: Agent.get(Config, &Map.fetch!(&1, key))
 
-  def filepath(),
-    do:
-      [config_fetch!(:dir), config_fetch!(:dbfilename)]
-      |> Path.join()
-      |> IO.inspect(label: "Filepath")
-
+  def filepath(), do: [config_fetch!(:dir), config_fetch!(:dbfilename)] |> Path.join()
+  def file_exists?(), do: filepath() |> File.exists?()
   def file(), do: filepath() |> File.read!()
-
   def is_config_key?(key), do: Agent.get(Config, &Map.has_key?(&1, key))
   def is_replica?(), do: is_config_key?(:replicaof)
 
@@ -108,6 +103,8 @@ defmodule Server do
 
     def propagate?(%Command{kind: kind}) when kind in ["SET"], do: true
     def propagate?(_), do: false
+
+    def blocking?(command), do: propagate?(command)
   end
 
   def start(_type, _args) do
@@ -159,74 +156,50 @@ defmodule Server do
     |> IO.inspect(label: "Parsed command")
   end
 
-  def set(kv_pair) do
-    true = :ets.insert(:redis, kv_pair)
-    :ets.tab2list(:redis) |> IO.inspect(label: "result of set")
-  end
-
   def exec(command, ctx) do
     IO.inspect({command, ctx}, label: "executing command")
     do_exec(command, ctx)
   end
 
-  def do_exec(%Command{kind: "PING"}, ctx) do
-    if not is_replica?(), do: :gen_tcp.send(ctx.client, @pong)
-  end
+  def do_exec(%Command{kind: "PING"}, ctx),
+    do: if(not is_replica?(), do: :gen_tcp.send(ctx.client, @pong))
 
   def do_exec(%Command{kind: "ECHO", args: [msg]}, ctx),
     do: :gen_tcp.send(ctx.client, Resp.encode(msg, @bulk_str))
 
   def do_exec(%Command{kind: "SET", args: [key, value, "px", expiry_ms]}, ctx) do
     expiration = :os.system_time(:millisecond) + String.to_integer(expiry_ms)
-    set({key, value, expiration})
+    MemoryDb.set({key, value, expiration})
     if not is_replica?(), do: :gen_tcp.send(ctx.client, ok())
   end
 
   def do_exec(%Command{kind: "SET", args: [key, value]}, ctx) do
-    set({key, value})
+    MemoryDb.set({key, value})
     if not is_replica?(), do: :gen_tcp.send(ctx.client, ok())
   end
 
-  def do_exec(%Command{kind: "GET", args: [key]}, ctx) do
-    value =
-      if is_config_key?(:dir) and is_config_key?(:dbfilename) do
-        Rdb.parse_file(file(), [])
-        |> elem(0)
-        |> Enum.find_value(fn
-          %Rdb.Section{
-            kind: :kv_pair,
-            data: %{key: candidate, val: val, expiretime: {expiretime, time_unit}}
-          }
-          when candidate == key ->
-            if expiretime <= :os.system_time(time_unit),
-              do: @null_bulk_str,
-              else: Resp.encode(val, @bulk_str)
+  def do_exec(%Command{kind: "TYPE", args: [key]}, ctx) do
+    if key in MemoryDb.keys() do
+      :gen_tcp.send(ctx.client, Resp.encode("string", @simple_str))
+    else
+      :gen_tcp.send(ctx.client, Resp.encode("none", @simple_str))
+    end
+  end
 
-          %Rdb.Section{kind: :kv_pair, data: %{key: candidate, val: val}}
-          when candidate == key ->
-            Resp.encode(val, @bulk_str)
-
-          _ ->
-            nil
-        end)
-        |> IO.inspect(label: "value for: " <> key)
-      else
-        case :ets.lookup(:redis, key) do
-          [] ->
-            raise "'#{key}' not found in ets"
-
-          [{^key, value, expiration}] ->
+  def do_exec(%Command{kind: "GET", args: [key]}, ctx),
+    do:
+      :gen_tcp.send(
+        ctx.client,
+        case MemoryDb.get(key) do
+          {^key, value, expiration} ->
             if expiration <= :os.system_time(:millisecond),
               do: @null_bulk_str,
               else: Resp.encode(value, @bulk_str)
 
-          [{^key, value}] ->
+          {^key, value} ->
             Resp.encode(value, @bulk_str)
         end
-      end
-
-    :gen_tcp.send(ctx.client, value)
-  end
+      )
 
   def do_exec(%Command{kind: "CONFIG", args: ["GET", name]}, ctx),
     do:
@@ -241,16 +214,7 @@ defmodule Server do
     do:
       :gen_tcp.send(
         ctx.client,
-        Rdb.parse_file(file(), [])
-        |> elem(0)
-        |> IO.inspect(label: "sections")
-        |> Enum.filter(fn
-          %Rdb.Section{kind: :kv_pair} -> true
-          _ -> false
-        end)
-        |> IO.inspect(label: "kv_pairs")
-        |> Enum.map(fn %Rdb.Section{data: %{key: key}} -> key end)
-        |> IO.inspect(label: "keys")
+        MemoryDb.keys()
         |> Enum.map(&Resp.encode(&1, @bulk_str))
         |> Resp.encode(@array)
       )
@@ -286,8 +250,6 @@ defmodule Server do
   def do_exec(%Command{kind: @replconf, args: ["ACK", _offset_at_ack]}, ctx) do
     Agent.update(ReplicaMap, &Map.update!(&1, ctx.client, fn _ -> %{in_sync: true} end))
     |> IO.inspect(label: "got ack from client, setting as in_sync")
-
-    send(self(), :ack)
   end
 
   def do_exec(%Command{kind: @psync, args: [_replid, _repl_offset]}, ctx) do
@@ -322,8 +284,8 @@ defmodule Server do
       )
       |> IO.inspect(label: "getack stream result")
 
-      _ = await_acks(acks_required, timeout_ms)
-      :ok = :gen_tcp.send(ctx.client, Resp.encode(get_synced_replicas(), @integer))
+      task = Task.async(fn -> await_acks(acks_required, timeout_ms) end)
+      :ok = :gen_tcp.send(ctx.client, Resp.encode(Task.await(task), @integer))
     end
   end
 
@@ -333,28 +295,23 @@ defmodule Server do
     raise "Unexpected command: " <> unknown_cmd.kind
   end
 
-  def await_acks(0, _),
-    do: :satisfied_all_acks |> IO.inspect(label: "finished awaiting target acks")
+  def await_acks(_, timeout_ms) when timeout_ms <= 0, do: get_synced_replicas()
 
-  def await_acks(acks_left, timeout_ms) do
-    start = System.monotonic_time(:millisecond)
+  def await_acks(acks_required, timeout_ms) do
+    IO.inspect({acks_required, timeout_ms, get_synced_replicas()}, label: "await_acks")
+    Process.sleep(100)
 
-    receive do
-      :ack ->
-        IO.inspect("received ack, need #{acks_left - 1} more")
-        elapsed = System.monotonic_time(:millisecond) - start
-        remaining_timeout = max(timeout_ms - elapsed, 0)
-        await_acks(acks_left - 1, remaining_timeout)
-    after
-      timeout_ms ->
-        :timed_out |> IO.inspect(label: "await_acks timed out, exiting")
+    if get_synced_replicas() >= acks_required do
+      get_synced_replicas()
+    else
+      await_acks(acks_required, timeout_ms - 100)
     end
   end
 
   def serve(ctx) do
-    case :gen_tcp.recv(ctx.client, 0) do
+    case :gen_tcp.recv(ctx.client, 0, 5000) do
       {:ok, data} ->
-        handle_commands(data, fn command ->
+        MsgHandler.handle_commands(data, fn command ->
           exec(command, ctx)
           # TODO: make concurrent
           if not is_replica?() and Command.propagate?(command),
@@ -373,19 +330,19 @@ defmodule Server do
       {:error, :closed} ->
         IO.inspect("Socket closed")
 
+      {:error, :timeout} ->
+        IO.inspect("Socket timed out")
+
       msg ->
-        IO.inspect(msg)
-        raise "Unknown"
+        IO.inspect(msg, label: "unexpected tcp recv result")
+        raise "unexpected tcp recv result"
     end
   end
 
   def loop_acceptor(ctx) do
     {:ok, client} = :gen_tcp.accept(ctx.socket)
 
-    Task.start_link(fn ->
-      Queue.start_link(%Ctx{ctx | client: client})
-      serve(%Ctx{ctx | client: client})
-    end)
+    Task.start_link(fn -> serve(%Ctx{ctx | client: client}) end)
 
     loop_acceptor(ctx)
   end
@@ -443,7 +400,13 @@ defmodule Server do
       end
 
     {file, propagated_commands} = Resp.decode_file(encoded_file)
-    {_, <<>>} = Rdb.parse_file(file, [])
+    {sections, <<>>} = Rdb.parse_file(file, [])
+
+    sections
+    |> Enum.filter(fn %Rdb.Section{kind: kind} -> kind == :kv_pair end)
+    |> Enum.map(fn %Rdb.Section{data: data} ->
+      data |> Map.to_list() |> Enum.map(&elem(&1, 1)) |> MemoryDb.set()
+    end)
 
     ctx = %Ctx{ctx | client: master_socket}
 
@@ -469,7 +432,17 @@ defmodule Server do
       :gen_tcp.listen(port, [:binary, active: false, reuseaddr: true])
       |> IO.inspect(label: "Listening to port: #{port}")
 
-    :ets.new(:redis, [:set, :public, :named_table])
+    {:ok, _} = MemoryDb.start_link(Map.new())
+    {:ok, _} = MsgHandler.start_link() |> IO.inspect(label: "started msghandler")
+
+    if is_config_key?(:dir) and is_config_key?(:dbfilename) and file_exists?(),
+      do:
+        Rdb.parse_file(file(), [])
+        |> elem(0)
+        |> Enum.filter(fn %Rdb.Section{kind: kind} -> kind == :kv_pair end)
+        |> Enum.map(fn %Rdb.Section{data: data} ->
+          data |> Map.values() |> List.to_tuple() |> MemoryDb.set()
+        end)
 
     {:ok, _} =
       Agent.start_link(&Map.new/0, name: ReplicaMap)

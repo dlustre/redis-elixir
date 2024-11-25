@@ -134,14 +134,14 @@ defmodule Rdb do
     IO.puts("expiretime")
     {key, tl} = consume(bin, :str_encoded) |> IO.inspect()
     {val, tl} = consume(tl, :str_encoded) |> IO.inspect()
-    {%Section{kind: :kv_pair, data: %{key: key, val: val, expiretime: {time, :second}}}, tl}
+    {%Section{kind: :kv_pair, data: %{key: key, val: val, expiretime_ms: time * 1000}}, tl}
   end
 
   def parse(<<@expiretime_ms, time::64-little, @string, bin::binary>>) do
     IO.puts("expiretime_ms")
     {key, tl} = consume(bin, :str_encoded) |> IO.inspect()
     {val, tl} = consume(tl, :str_encoded) |> IO.inspect()
-    {%Section{kind: :kv_pair, data: %{key: key, val: val, expiretime: {time, :millisecond}}}, tl}
+    {%Section{kind: :kv_pair, data: %{key: key, val: val, expiretime_ms: time}}, tl}
   end
 
   def parse(<<@aux, bin::binary>>) do

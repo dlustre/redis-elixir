@@ -1,0 +1,4 @@
+- [x] have config/offset be an agent
+- [x] do single clause serve()
+- [x] big problem with race condition on #YG4, trying to make it so that commands are handled sequentially with msg handler
+- [x] problem, not getting acknowledgements via self msg, because each exec is a separate task instead of one
