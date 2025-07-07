@@ -1,6 +1,7 @@
 default_config = %{
   port: 6379,
   master_replid: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
+  # Keeps track of how many bytes of commands have been added to the replication stream.
   master_repl_offset: 0
 }
 
@@ -246,6 +247,7 @@ defmodule Server do
         |> Enum.map(&Resp.encode(&1, @bulk_str))
         |> Resp.encode(@array)
       )
+      |> IO.inspect(label: "result of responding to getack *")
 
   def do_exec(%Command{kind: @replconf, args: ["ACK", _offset_at_ack]}, ctx) do
     Agent.update(ReplicaMap, &Map.update!(&1, ctx.client, fn _ -> %{in_sync: true} end))
@@ -340,7 +342,8 @@ defmodule Server do
   end
 
   def loop_acceptor(ctx) do
-    {:ok, client} = :gen_tcp.accept(ctx.socket)
+    {:ok, client} =
+      :gen_tcp.accept(ctx.socket) |> IO.inspect(label: "accept result in loop_acceptor")
 
     Task.start_link(fn -> serve(%Ctx{ctx | client: client}) end)
 
@@ -387,17 +390,16 @@ defmodule Server do
 
     {:ok, res} = :gen_tcp.recv(master_socket, 0)
 
-    encoded_file =
-      case Resp.consume_simple_str(res) do
-        {_, ""} ->
-          IO.puts("need to recv file")
-          {:ok, file} = :gen_tcp.recv(master_socket, 0)
-          file
+    case Resp.consume_simple_str(res) do
+      {_, ""} ->
+        IO.puts("need to recv file")
 
-        {_, file} ->
-          IO.puts("file already sent")
-          file
-      end
+      {_, rest} ->
+        IO.puts("received extra bytes, returning them to buffer")
+        :gen_tcp.unrecv(master_socket, rest)
+    end
+
+    {:ok, encoded_file} = :gen_tcp.recv(master_socket, 0)
 
     {file, propagated_commands} = Resp.decode_file(encoded_file)
     {sections, <<>>} = Rdb.parse_file(file, [])

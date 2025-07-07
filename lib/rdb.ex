@@ -13,6 +13,15 @@ defmodule Rdb do
   @next_thirty_two <<0b10::2>>
   @special <<0b11::2>>
 
+  @disable_logs true
+
+  def log(item, opts \\ []) do
+    case @disable_logs do
+      true -> item
+      false -> IO.inspect(item, opts)
+    end
+  end
+
   defmodule Section do
     @enforce_keys [:kind, :data]
     defstruct [:kind, :data]
@@ -25,13 +34,13 @@ defmodule Rdb do
       )
 
   def consume(<<@next_six, length::6, tl::binary>>, :length_encoded),
-    do: {length, tl} |> IO.inspect(label: "length_encoded: next_six")
+    do: {length, tl} |> log(label: "length_encoded: next_six")
 
   def consume(<<@next_fourteen, length::14, tl::binary>>, :length_encoded),
-    do: {length, tl} |> IO.inspect(label: "length_encoded: next_fourteen")
+    do: {length, tl} |> log(label: "length_encoded: next_fourteen")
 
   def consume(<<@next_thirty_two, _::6, length::32, tl::binary>>, :length_encoded),
-    do: {length, tl} |> IO.inspect(label: "length_encoded: next_thirty_two")
+    do: {length, tl} |> log(label: "length_encoded: next_thirty_two")
 
   def consume(<<@special, str_format::6, tl::binary>>, :length_encoded) do
     case str_format do
@@ -45,33 +54,33 @@ defmodule Rdb do
     case consume(bin, :length_encoded) do
       {:eight, tl} ->
         <<int, tl::binary>> = tl
-        {int, tl} |> IO.inspect(label: "str_encoded:eight")
+        {int, tl} |> log(label: "str_encoded:eight")
 
       {:sixteen, tl} ->
         <<int::16-little, tl::binary>> = tl
-        {int, tl} |> IO.inspect(label: "str_encoded:sixteen")
+        {int, tl} |> log(label: "str_encoded:sixteen")
 
       {:thirtytwo, tl} ->
         <<int::32-little, tl::binary>> = tl
-        {int, tl} |> IO.inspect(label: "str_encoded:thirtytwo")
+        {int, tl} |> log(label: "str_encoded:thirtytwo")
 
       {length, tl} ->
         <<str::size(length)-binary, tl::binary>> = tl
-        {str, tl} |> IO.inspect(label: "str_encoded")
+        {str, tl} |> log(label: "str_encoded")
     end
   end
 
   def parse(<<@eof, checksum::64, tl::binary>>) do
     IO.puts("eof")
-    {%Section{kind: :eof, data: %{checksum: checksum}}, tl} |> IO.inspect(label: "parsed eof")
+    {%Section{kind: :eof, data: %{checksum: checksum}}, tl} |> log(label: "parsed eof")
   end
 
   def parse(<<@selectdb, bin::binary>>) do
     IO.puts("selectdb")
-    {db_index, tl} = consume(bin, :length_encoded) |> IO.inspect()
+    {db_index, tl} = consume(bin, :length_encoded) |> log()
     <<@resizedb, tl::binary>> = tl
-    {table_size, tl} = consume(tl, :length_encoded) |> IO.inspect()
-    {expire_table_size, tl} = consume(tl, :length_encoded) |> IO.inspect()
+    {table_size, tl} = consume(tl, :length_encoded) |> log()
+    {expire_table_size, tl} = consume(tl, :length_encoded) |> log()
 
     {%Section{
        kind: :selectdb,
@@ -81,29 +90,29 @@ defmodule Rdb do
 
   def parse(<<@string, bin::binary>>) do
     IO.puts("string no expiry")
-    {key, tl} = consume(bin, :str_encoded) |> IO.inspect()
-    {val, tl} = consume(tl, :str_encoded) |> IO.inspect()
+    {key, tl} = consume(bin, :str_encoded) |> log()
+    {val, tl} = consume(tl, :str_encoded) |> log()
     {%Section{kind: :kv_pair, data: %{key: key, val: val}}, tl}
   end
 
   def parse(<<@expiretime, time::32-little, bin::binary>>) do
     IO.puts("expiretime")
-    {key, tl} = consume(bin, :str_encoded) |> IO.inspect()
-    {val, tl} = consume(tl, :str_encoded) |> IO.inspect()
+    {key, tl} = consume(bin, :str_encoded) |> log()
+    {val, tl} = consume(tl, :str_encoded) |> log()
     {%Section{kind: :kv_pair, data: %{key: key, val: val, expiretime_ms: time * 1000}}, tl}
   end
 
   def parse(<<@expiretime_ms, time::64-little, @string, bin::binary>>) do
     IO.puts("expiretime_ms")
-    {key, tl} = consume(bin, :str_encoded) |> IO.inspect()
-    {val, tl} = consume(tl, :str_encoded) |> IO.inspect()
+    {key, tl} = consume(bin, :str_encoded) |> log()
+    {val, tl} = consume(tl, :str_encoded) |> log()
     {%Section{kind: :kv_pair, data: %{key: key, val: val, expiretime_ms: time}}, tl}
   end
 
   def parse(<<@aux, bin::binary>>) do
     IO.puts("aux")
-    {key, tl} = consume(bin, :str_encoded) |> IO.inspect()
-    {val, tl} = consume(tl, :str_encoded) |> IO.inspect()
+    {key, tl} = consume(bin, :str_encoded) |> log()
+    {val, tl} = consume(tl, :str_encoded) |> log()
     {%Section{kind: :aux, data: %{key: key, val: val}}, tl}
   end
 
@@ -115,7 +124,7 @@ defmodule Rdb do
   def parse_file(bin, acc) do
     case parse(bin) do
       {%Section{kind: :eof} = section, tl} -> {Enum.reverse([section | acc]), tl}
-      {section, tl} -> parse_file(tl, [section |> IO.inspect(label: "Parsed section") | acc])
+      {section, tl} -> parse_file(tl, [section |> log(label: "Parsed section") | acc])
     end
   end
 end
