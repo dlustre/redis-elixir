@@ -24,50 +24,6 @@ defmodule Rdb do
         "UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZW3CsMQQAPoIYW9mLWJhc2XAAP/wbjv+wP9aog=="
       )
 
-  def test_length_encoding() do
-    consume(<<0x0A>>, :length_encoded) |> elem(0) |> Util.assert_equals(10)
-
-    consume(<<0x42, 0xBC>>, :length_encoded)
-    |> elem(0)
-    |> Util.assert_equals(700)
-
-    consume(<<0x80, 0x00, 0x00, 0x42, 0x68>>, :length_encoded)
-    |> elem(0)
-    |> Util.assert_equals(17000)
-
-    consume(<<0b11::2>>, :length_encoded)
-  end
-
-  def test_str_encoding() do
-    consume(
-      <<0x0D, 0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x2C, 0x20, 0x57, 0x6F, 0x72, 0x6C, 0x64, 0x21>>,
-      :str_encoded
-    )
-    |> elem(0)
-    |> Util.assert_equals("Hello, World!")
-
-    consume(
-      <<0xC0, 0x7B, 0xFF>>,
-      :str_encoded
-    )
-    |> elem(0)
-    |> Util.assert_equals(123)
-
-    consume(
-      <<0xC1, 0x39, 0x30>>,
-      :str_encoded
-    )
-    |> elem(0)
-    |> Util.assert_equals(12345)
-
-    consume(
-      <<0xC2, 0x87, 0xD6, 0x12, 0x00>>,
-      :str_encoded
-    )
-    |> elem(0)
-    |> Util.assert_equals(1_234_567)
-  end
-
   def consume(<<@next_six, length::6, tl::binary>>, :length_encoded),
     do: {length, tl} |> IO.inspect(label: "length_encoded: next_six")
 
@@ -161,5 +117,55 @@ defmodule Rdb do
       {%Section{kind: :eof} = section, tl} -> {Enum.reverse([section | acc]), tl}
       {section, tl} -> parse_file(tl, [section |> IO.inspect(label: "Parsed section") | acc])
     end
+  end
+end
+
+defmodule RdbTest do
+  import Rdb
+  use ExUnit.Case
+  import Util
+
+  test "length encoding" do
+    consume(<<0x0A>>, :length_encoded) |> elem(0) |> assert_equals(10)
+
+    consume(<<0x42, 0xBC>>, :length_encoded)
+    |> elem(0)
+    |> assert_equals(700)
+
+    consume(<<0x80, 0x00, 0x00, 0x42, 0x68>>, :length_encoded)
+    |> elem(0)
+    |> assert_equals(17000)
+
+    consume(<<0b11::2>>, :length_encoded)
+  end
+
+  test "string encoding" do
+    consume(
+      <<0x0D, 0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x2C, 0x20, 0x57, 0x6F, 0x72, 0x6C, 0x64, 0x21>>,
+      :str_encoded
+    )
+    |> elem(0)
+    |> assert_equals("Hello, World!")
+
+    consume(
+      <<0xC0, 0x7B, 0xFF>>,
+      :str_encoded
+    )
+    |> elem(0)
+    |> assert_equals(123)
+
+    consume(
+      <<0xC1, 0x39, 0x30>>,
+      :str_encoded
+    )
+    |> elem(0)
+    |> assert_equals(12345)
+
+    consume(
+      <<0xC2, 0x87, 0xD6, 0x12, 0x00>>,
+      :str_encoded
+    )
+    |> elem(0)
+    |> assert_equals(1_234_567)
   end
 end
